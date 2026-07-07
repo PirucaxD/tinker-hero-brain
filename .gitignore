@@ -1,0 +1,3 @@
+*.bak
+*.log
+!tools/testdata/*.log

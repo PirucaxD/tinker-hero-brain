@@ -1,0 +1,7 @@
+[INFO] [Tinker] farm | t=44.0 | pick=shove | lane=mid | vis=y | act=shove | reason=due | travel=3.0 | gpm=100
+[INFO] [Tinker] march_aim src=shove pat=front lane=mid wave=(100,100) cast=(50,50) creeps=4 dWave=500
+[INFO] [Tinker] farm | t=70.0 | pick=shove | lane=top | vis=y | act=jungle | reason=slack | travel=4.0 | swtop=ok:0.10 | swbot=thin:-1.00 | gpm=120
+[INFO] [Tinker] march_aim src=shove pat=front lane=top wave=(-6200,3800) cast=(-6300,3500) creeps=3 dWave=600
+[INFO] [Tinker] farm | t=76.0 | pick=camp | act=jungle | reason=thin_wave | swtop=contested:0.20 | swbot=fogged:-1.00 | gpm=130
+[INFO] [Tinker] farm | t=104.0 | pick=shove | lane=mid | vis=n | act=shove | reason=near_due | travel=6.0 | gpm=150
+[INFO] [Tinker] farm | t=112.0 | pick=refill | act=recover | reason=recharge | gpm=150
