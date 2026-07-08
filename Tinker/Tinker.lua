@@ -107,6 +107,7 @@ local K = {
     GANK_FOG_REACH  = 600,                       -- v0.1.158 (F4 recalibration): cap on how far a FOGGED enemy's probable disc extends its gank reach (~1.1s of fog) - the raw disc hits 2750u at the age cap and matched stale enemies from half a screen away (risk-0.14 aborts).
     TOWER_ALIVE_R     = 300,                       -- v0.1.105 lane-prioritization: an enemy tower this near a static T1 spot = that T1 is alive (towers don't move; T1<->T2 mid are ~2200u apart so no cross-match). ponytail ceiling.
     TOWER_DYING_MARGIN_S = 3,                      -- v0.1.246 (TINKER_TOWER_DEATH_DESIGN.md): a crash tower predicted dead before our arrival + this margin excludes the wave this decide (cwhy/verdict tower_dying) - the wave lingers briefly after the fall, so arrival within eta+margin is still farmable.
+    ENGAGE_MANA_WAIT_S   = 4,                      -- v0.1.249 P3: raw mana a sip short of March at the wave (cd done, effective covers) holds this long for the bottle/regen instead of bailing the whole trip home (run-64 S4: a doomed dispatch cast zero W).
     TOWER_RISK_RADIUS = 900, TOWER_RISK_WEIGHT = 0.7, TOWER_ATTACK_RANGE = 700,   -- Deep 1 (v0.1.76 PLATEAU): the live-abort positional veto. A live enemy tower within ATTACK_RANGE = full WEIGHT (decisively unsafe), tapering linearly to 0 at RADIUS. WEIGHT 0.7 > SHOVE_SAFE_RISK 0.35 so lane_unsafe trips within ~800; catches the v0.1.73 death stand (791u -> 0.38).
     TOWER_SAFE_MARGIN = 200,                       -- note 1 / option A (v0.1.159): a STAND must sit at least ATTACK_RANGE + this from every alive enemy tower (900 = the taper edge, risk 0). The old risk<0.35 gate stopped clamping at ~800 = "barely outside" the tower. March reach (1200) still covers 300 past the tower from 900, so the tower-border W-farm is intact. Stricter than the live abort = the SAFE direction of the v0.1.148 consistency rule.
     FRONTIER_CACHE_S  = 0.5,                       -- structure-list cache for frontier_excess (enumerating every call inside the 40-step clamp loop is waste)
@@ -501,10 +502,13 @@ local function keen_home()
     return false
 end
 -- Rearm if ready and affordable (reserves escape mana); sets the channel timer + verify.
-local function try_rearm()
+local function try_rearm(reserve)
     if not ready(State.rearm) then return false end
     local rcost = (Ability.GetManaCost and Ability.GetManaCost(State.rearm)) or K.REARM_MANA_FB   -- v0.1.97: was a hardcoded 150 (Rearm fallback is 225)
-    if mana() < State.menu.escapeMana:Get() + rcost then return false end
+    -- v0.1.249 P1 (run-64 S1: walk_home x24 with rearm+keen affordable): RETURN legs pass a
+    -- smaller reserve (the keen cost - you are teleporting HOME, landing at the fountain; the
+    -- escape buffer double-books there). Field callers pass nothing = the full escape reserve.
+    if mana() < (reserve or State.menu.escapeMana:Get()) + rcost then return false end
     if not cast_no_target(State.rearm) then return false end
     local lvl = (Ability.GetLevel and Ability.GetLevel(State.rearm)) or 1
     State.channelUntil = now() + (K.REARM_CHANNEL[lvl] or K.REARM_CHANNEL[1]) + K.CHANNEL_PAD
@@ -2564,6 +2568,7 @@ local function dispatch_shove(lane, sc, casts, ref)
     State.marchCasts, State.fsm = 0, "MOVE"
     State.moveSince = now(); State.moveTrack = nil
     State.keenedSpot = false; State.marchPending = nil; State.emptySince = nil
+    State.engageManaWait = nil   -- v0.1.249 P3: fresh sip-wait budget per engage
 end
 
 -- ALL-LANES side-lane evaluation (extracted v0.1.229 - ONE producer for the Tier-1.5
@@ -3775,6 +3780,7 @@ local function fsm_engage_wave(s)
         return
     end
     if ready(State.march) then
+        State.engageManaWait = nil   -- v0.1.249 P3: a resolved sip re-arms the wait budget
         local aim = s.standSpot.aim
         local maxr = (K.MARCH_CAST_RANGE or 300) - 20
         -- THE lane W pattern (v0.1.166 user design; v0.1.173 fixed after the run-11 report "both
@@ -3867,6 +3873,25 @@ local function fsm_engage_wave(s)
             elseif not State.wantBehind then State.wantBehind = true end
             logline(string.format("march_aim src=shove pat=%s lane=%s wave=(%.0f,%.0f) cast=(%.0f,%.0f) creeps=%d dWave=%.0f",
                 behind and "behind" or "front", tostring(s.lane), live.cx, live.cy, cp.x, cp.y, live.n, me:Distance(s.refPoint)))
+        end
+    elseif cd_remaining(State.march) <= 0.1 and effective_mana() >= abil_mana(State.march, K.MARCH_MANA_FB) then
+        -- v0.1.249 P3 (run-64 S4: keen to a VISIBLE 5-creep wave, cast ZERO W, trekked home):
+        -- ready() is RAW-mana castability while every gate is EFFECTIVE-mana - the keen spent
+        -- 75 in transit and raw landed just under March's cost with the cd DONE. That is a
+        -- bottle sip away, not a Rearm case (the old belt misread it as rearm_unfundable and
+        -- burned the whole trip). HOLD briefly: bottle_tick sips per tick, regen runs, the
+        -- cast branch fires the moment raw covers. Past the cap the original bail runs.
+        if not State.engageManaWait then State.engageManaWait = now() end
+        if now() - State.engageManaWait <= K.ENGAGE_MANA_WAIT_S then
+            State.waitInfo = { why = "mana sip", t = now() }
+            if now() - (State.sipLogT or 0) > 2.0 then
+                State.sipLogT = now()
+                logline(string.format("engage_wait reason=mana_sip raw=%d eff=%d", mana(), effective_mana()))
+            end
+        else
+            logline(string.format("engage_bail reason=mana_sip_timeout raw=%d", mana()))
+            if s.shove then suppress_shove(s.lane, now() + K.SHOVE_STUCK_S) end
+            go_return()
         end
     elseif effective_mana() < abil_mana(State.rearm, K.REARM_MANA_FB) + abil_mana(State.march, K.MARCH_MANA_FB) then
         -- v0.1.200 guard (run-28 t=483, belt to the hop-gate fix): in a WAVE engage Rearm exists
@@ -4181,9 +4206,43 @@ local function fsm_return()   -- REFILL: Keen home -> Rearm to reset Keen -> wai
     -- self-cast Keen auto-conveys to fountain when >1500 away (V2-confirmed idiom).
     if ready(State.keen) then
         if keen_home() then logline("return keen_base") end
-    elseif try_rearm() then                                     -- Keen on cd in the field: Rearm to reset it
+    elseif try_rearm((Ability.GetManaCost and Ability.GetManaCost(State.keen)) or K.KEEN_MANA_FB) then   -- v0.1.249 P1: return leg reserves only the keen cost, not the escape buffer
         logline("return rearm_reset_keen")
     else
+        -- v0.1.249 P2 (run-64 S1, user: "wait a couple seconds to keen" beats a cross-map walk):
+        -- when SAFE, and the teleport becomes available soon (keen cd ending, or a small mana
+        -- deficit at the live regen rate - the bottle sips per tick accelerate it), HOLD instead
+        -- of committing to the walk. Re-evaluated every tick: mana/cd progress shrinks the wait,
+        -- danger (the same gates as the en-route resume) or a stalled estimate flips it to the
+        -- walk. No run-57 deadlock class here: keen home always has a target (the fountain).
+        do
+            local me = origin(h)
+            local klvl = (State.keen and Ability.GetLevel and Ability.GetLevel(State.keen)) or 0
+            local fp0 = friendly_fountain_pos()
+            if klvl >= 1 and fp0 then
+                local ms = (NPC.GetMoveSpeed and NPC.GetMoveSpeed(h)) or 320
+                local walk_s = me:Distance(Vector(fp0.x, fp0.y, me.z)) / math.max(150, ms)
+                local kcost = (Ability.GetManaCost and Ability.GetManaCost(State.keen)) or K.KEEN_MANA_FB
+                local rcost = (Ability.GetManaCost and Ability.GetManaCost(State.rearm)) or K.REARM_MANA_FB
+                local regen = mana_regen_read()
+                local kcd = (Ability.GetCooldownTimeRemaining and Ability.GetCooldownTimeRemaining(State.keen)) or 999
+                -- path A: keen's own cd ends (+ any mana shortfall for the keen itself)
+                local wait_k = math.max(kcd, (kcost - mana()) / regen)
+                -- path B: rearm resets keen (needs rearm ready + rcost + kcost funded)
+                local wait_r = ready(State.rearm) and math.max(0, (rcost + kcost - mana()) / regen) or math.huge
+                local wait_s = math.min(wait_k, wait_r)
+                if wait_s + K.KEEN_CHANNEL + 2.0 < walk_s
+                   and enemy_risk_at(me) < K.FARM_SAFE_RISK and not lane_unsafe({ x = me.x, y = me.y }) then
+                    State.waitInfo = { why = string.format("return wait %ds", math.ceil(wait_s)), t = now() }
+                    State.moveSince = now(); State.moveTrack = nil   -- intentional hold: feed the watchdogs
+                    if now() - (State.returnWaitLogT or 0) > 2.0 then
+                        State.returnWaitLogT = now()
+                        logline(string.format("return_wait wait=%.1f walk=%.1f mana=%d kcd=%.1f", wait_s, walk_s, mana(), kcd))
+                    end
+                    return
+                end
+            end
+        end
         -- Note 2: Keen on cd AND can't Rearm (low mana after a shove) -> Tinker stood IDLE in the field
         -- with no walk-home fallback and no watchdog = the silent stuck. Walk toward the fountain instead.
         local fp = friendly_fountain_pos()
@@ -4953,6 +5012,6 @@ for cb_name, cb_fn in pairs(callbacks) do
     end
 end
 
-if LOG then LOG:info("Tinker brain v0.1.248 (the .247 crash-class BELT, tester follow-up flag: Nav.SafeDest/snap_walkable hand back plain {x,y} tables while some lib entry points call engine-Vector methods on their params - the same :Distance2D class could bite any lib call receiving a stand/landing. THIS VERSION: FogProximityRisk de-methodized [component .x/.y math, accepts plain tables AND Vectors, and is MORE pure - engine-method-free]; the .247 hero-side wrap in enemy_risk_at stays as the second belt. CENSUS RECORDED [bridge]: ~17 param-method sites across escape/geometry/defense, most on engine-sourced data [snapshot positions, velocities = safe]; the standing CONVENTION = positions crossing hero->lib are normalized to engine Vectors at the hero boundary [the enemy_tower_risk/enemy_risk_at idiom], libs prefer component math; the full de-methodize sweep = queued, not urgent. Includes .247 [stuck-in-DECIDE fix]. Suite 713/0.") end
+if LOG then LOG:info("Tinker brain v0.1.249 (ARC A: RETURN-LEG TRANSPORT, the run-64 real-lobby sightings S1+S4, one mana-boundary version. P1 RETURN REARM RESERVE: try_rearm gains a reserve param; fsm_return passes the keen cost instead of the escape buffer [teleporting HOME double-booked the reserve - walk_home x24 vs rearm_reset_keen x3]. P2 RETURN WAIT-VS-WALK: when SAFE [the resume-path risk gates] and the teleport is close [keen cd ending, or a small mana deficit at live regen - bottle sips accelerate], HOLD re-evaluated per tick instead of the cross-map walk [return_wait log; no run-57 deadlock class - keen home always has a target]. P3 THE MANA-SIP BELT: at a wave, March cd DONE + raw a sip short + effective covers -> ready() [RAW castability] read false and the old belt misread it as rearm_unfundable, burning the whole trip [run-64: keen to a visible 5-creep wave, zero W, trekked home]; now HOLD up to ENGAGE_MANA_WAIT_S 4 [engage_wait reason=mana_sip; bottle_tick sips per tick], past the cap the old bail runs [mana_sip_timeout]. Suite 713/0.") end
 
 return callbacks
