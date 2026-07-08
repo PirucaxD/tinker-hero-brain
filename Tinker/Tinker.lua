@@ -30,6 +30,7 @@ local Nav       = require("lib.nav")          -- lane nav chokepoint (Piece 0): 
 local Schedule  = require("lib.schedule")     -- timing-anchored shove-cycle controller (ClearTime + Plan)
 local Escape    = require("lib.escape")        -- fog-aware proximity risk (COR-1)
 local Geometry  = require("lib.geometry")      -- pure geometry: teleport reach-disc landing (Keen/BoT)
+local Towers    = require("lib.towers")        -- v0.1.246: per-tower alive flag + measured hp-slope death eta
 
 local UO = Enum.UnitOrder
 local HERO_KEY = "tinker"
@@ -105,6 +106,7 @@ local K = {
     GANK_RADIUS     = 1000,                      -- v0.1.95: lane_unsafe counts a GANK (>=2 enemies) only within this of the point - 2 DISTANT enemies (the v0.1.94 log recovered at risk 0.06 with enH=2 ~1057u away) are not a gank. Tighter than RISK_RADIUS. ponytail ceiling.
     GANK_FOG_REACH  = 600,                       -- v0.1.158 (F4 recalibration): cap on how far a FOGGED enemy's probable disc extends its gank reach (~1.1s of fog) - the raw disc hits 2750u at the age cap and matched stale enemies from half a screen away (risk-0.14 aborts).
     TOWER_ALIVE_R     = 300,                       -- v0.1.105 lane-prioritization: an enemy tower this near a static T1 spot = that T1 is alive (towers don't move; T1<->T2 mid are ~2200u apart so no cross-match). ponytail ceiling.
+    TOWER_DYING_MARGIN_S = 3,                      -- v0.1.246 (TINKER_TOWER_DEATH_DESIGN.md): a crash tower predicted dead before our arrival + this margin excludes the wave this decide (cwhy/verdict tower_dying) - the wave lingers briefly after the fall, so arrival within eta+margin is still farmable.
     TOWER_RISK_RADIUS = 900, TOWER_RISK_WEIGHT = 0.7, TOWER_ATTACK_RANGE = 700,   -- Deep 1 (v0.1.76 PLATEAU): the live-abort positional veto. A live enemy tower within ATTACK_RANGE = full WEIGHT (decisively unsafe), tapering linearly to 0 at RADIUS. WEIGHT 0.7 > SHOVE_SAFE_RISK 0.35 so lane_unsafe trips within ~800; catches the v0.1.73 death stand (791u -> 0.38).
     TOWER_SAFE_MARGIN = 200,                       -- note 1 / option A (v0.1.159): a STAND must sit at least ATTACK_RANGE + this from every alive enemy tower (900 = the taper edge, risk 0). The old risk<0.35 gate stopped clamping at ~800 = "barely outside" the tower. March reach (1200) still covers 300 past the tower from 900, so the tower-border W-farm is intact. Stricter than the live abort = the SAFE direction of the v0.1.148 consistency rule.
     FRONTIER_CACHE_S  = 0.5,                       -- structure-list cache for frontier_excess (enumerating every call inside the 40-step clamp loop is waste)
@@ -573,6 +575,23 @@ local function enemy_lane_t1(lane)
         if Entity.GetTeamNum(t) ~= State.team and Entity.IsAlive(t) then return pos, true end
     end
     return pos, false
+end
+
+-- v0.1.246 (TINKER_TOWER_DEATH_DESIGN.md): resolve a tower position to its registry key
+-- (the nearest static spot within TOWER_ALIVE_R). nil when no spot matches.
+local function tower_key_near(pos)
+    if not pos then return nil end
+    local best, bd
+    for _, t in ipairs(MapData.TOWERS or {}) do
+        if t.pos then
+            local dx, dy = t.pos[1] - pos.x, t.pos[2] - pos.y
+            local d = dx * dx + dy * dy
+            if d <= K.TOWER_ALIVE_R * K.TOWER_ALIVE_R and (not bd or d < bd) then
+                bd, best = d, t.name .. "@" .. tostring(t.team)
+            end
+        end
+    end
+    return best
 end
 
 -- v0.1.201 (user directive, run-29): after the enemy mid T1 DROPS, lane positioning is LEASHED to
@@ -1697,6 +1716,27 @@ local function run_lane_scan(arm_overlay)
     })
     State.laneScan = lanes
     if arm_overlay then State.laneScanUntil = now() + K.TEST_OVERLAY_SEC end
+    -- v0.1.246 tower registry feed (TINKER_TOWER_DEATH_DESIGN.md): one sampling pass per
+    -- 2s scan over the static spots. Buildings are always visible, so a spot with no alive
+    -- entity AFTER having been seen alive = the tower is gone (the lib latches it forever).
+    do
+        local samples = {}
+        for _, t in ipairs(MapData.TOWERS or {}) do
+            if t.pos and t.name and t.team then
+                local key = t.name .. "@" .. tostring(t.team)
+                local ent
+                for _, e in ipairs(Map.TowersInRadius(Vector(t.pos[1], t.pos[2], 0), K.TOWER_ALIVE_R) or {}) do
+                    if Entity.GetTeamNum(e) == t.team and Entity.IsAlive(e) then ent = e; break end
+                end
+                if ent then
+                    samples[#samples + 1] = { key = key, hp = Entity.GetHealth(ent), alive = true }
+                elseif Towers.Alive(State.towerTrack, key) then
+                    samples[#samples + 1] = { key = key, alive = false }
+                end
+            end
+        end
+        State.towerTrack = Towers.Track(State.towerTrack, samples, now())
+    end
     -- Piece 1 (lane instruments, TINKER_LANE_NAV_DESIGN.md roadmap): CLEAN k=v rows + the truth
     -- fields (fronts/meeting/hp/prediction) so the offline `--lane-report` can measure each wave
     -- instrument against observed reality: arrival timing vs NextWaveArrival (+ the real spawn-grid
@@ -2115,10 +2155,12 @@ local function schedule_ctx(lanes)
     -- in front of it), never PAST it. This crashes the tower (the goal) AND stops the deep dives (note 2:
     -- walking under/past the tower). T1 dead -> no clamp; the depth/time gate (rule 2) decides the dive.
     local deep_era = false
+    local crashTwrPos                                       -- v0.1.246: the wave's tower terminus, when one exists
     do
         local t1, t1alive = enemy_lane_t1(K.HOME_LANE)
         if t1alive and t1 and stand_depth(crash_pos) > stand_depth(t1) then
             crash_pos = { x = t1.x, y = t1.y }
+            crashTwrPos = t1
         end
         deep_era = not t1alive          -- v0.1.196: the DEEP-FARM era = their mid T1 DOWN. While it stands the lane phase owns everything (crash clamp, thin 400) - 100% untouched, per the user.
     end
@@ -2251,6 +2293,21 @@ local function schedule_ctx(lanes)
     -- a legal covering stand exists AND we get there before the fight ends.
     local gone = (gone_fight_rel and not (covers and travel_to_mid < gone_fight_rel)) and true or false
 
+    -- v0.1.246 (TINKER_TOWER_DEATH_DESIGN.md): the crash tower is MELTING - predicted dead
+    -- before we can arrive (+margin). The wave terminus vanishes with it (the wave pushes
+    -- past), so a dispatch/hold on it becomes the 25s stale stand. Exclude THIS decide
+    -- (the gone_by_arrival shape, re-evaluated every 0.4s); once the tower actually falls,
+    -- deep_era owns the lane exactly as today. Undamaged/fogged towers predict math.huge
+    -- (the lib's conservative default) = zero behavior change outside an active melt.
+    if not crashTwrPos and cl and cl.crashing and cl.crash_tower and cl.crash_tower.team ~= State.team then
+        crashTwrPos = { x = cl.crash_tower.pos.x, y = cl.crash_tower.pos.y }
+    end
+    local crash_twr_key = tower_key_near(crashTwrPos)
+    if crash_twr_key and covers
+       and Towers.DeathEta(State.towerTrack, crash_twr_key, now()) < travel_to_mid + K.TOWER_DYING_MARGIN_S then
+        covers, cwhy = false, "tower_dying"
+    end
+
     -- v0.1.76: the shove gate = enemy HEROES (fog-aware) + enemy-TOWER range ONLY.
     -- StructuralRisk (depth) was REMOVED here: a winning mid shove stands forward at the
     -- same depth as an under-tower dive, so depth vetoed EVERY legit shove (v0.1.75
@@ -2333,6 +2390,7 @@ local function schedule_ctx(lanes)
         -- fight end (their remnant emerges) - the arrival the scheduler already set.
         meet_eta = (pm and (bal or 0) >= 0) and (now() + math.max(0, pm.eta)) or nil,
         clash = cl,                                         -- v0.1.105: settle = the wave MEETING point for the tower-aware veto
+        crash_tower_key = crash_twr_key,                    -- v0.1.246: rides the spot for the hold tripwire
     }
 end
 
@@ -2363,10 +2421,12 @@ local function side_wave_ctx(lane, s)
     end
     local crash_pos = (pm and pm.point) or s.meeting
     if not crash_pos then return nil, "fogged" end
+    local crashTwrPos                                        -- v0.1.246: the wave's tower terminus, when one exists
     do  -- crash clamp at THIS lane's alive enemy T1 (same rule as mid)
         local t1, t1alive = enemy_lane_t1(lane)
         if t1alive and t1 and stand_depth(crash_pos) > stand_depth(t1) then
             crash_pos = { x = t1.x, y = t1.y }
+            crashTwrPos = t1
         end
     end
     local eff_hp = (ew and ew.hp) or 0
@@ -2404,6 +2464,17 @@ local function side_wave_ctx(lane, s)
     if raidcap then
         local transit = (ready(State.keen) and 0 or rearm_channel()) + K.KEEN_CHANNEL + 1.5
         travel = math.min(travel, transit)
+    end
+    -- v0.1.246 (TINKER_TOWER_DEATH_DESIGN.md): a MELTING crash tower dies before we arrive -
+    -- the terminus (and the wave with it) is gone by then; named snub, re-competes next decide.
+    if not crashTwrPos and s.clash and s.clash.crashing and s.clash.crash_tower
+       and s.clash.crash_tower.team ~= State.team then
+        crashTwrPos = { x = s.clash.crash_tower.pos.x, y = s.clash.crash_tower.pos.y }
+    end
+    local crash_twr_key = tower_key_near(crashTwrPos)
+    if crash_twr_key
+       and Towers.DeathEta(State.towerTrack, crash_twr_key, now()) < travel + K.TOWER_DYING_MARGIN_S then
+        return nil, "tower_dying"
     end
     -- stand: the SAME safe composition, leash keyed to this lane; per-lane depth points
     local fwd = not lane_unsafe({ x = crash_pos.x, y = crash_pos.y })
@@ -2460,6 +2531,7 @@ local function side_wave_ctx(lane, s)
         travel = travel, gold = (ew and ew.gold) or 0, cwhy = cwhy,
         defend = (s.clash and s.clash.crashing and s.clash.crash_tower
                   and s.clash.crash_tower.team == State.team and dpts == 0) and true or false,
+        crash_tower_key = crash_twr_key,                    -- v0.1.246: rides the spot for the hold tripwire
     }
 end
 
@@ -2477,6 +2549,7 @@ local function dispatch_shove(lane, sc, casts, ref)
         waveEta = sc.wave_eta,                        -- Piece 2: the kinematic deadline (frozen with the stand)
         meetEta = sc.meet_eta,                        -- v0.1.213: the meeting/fight-start time (pre-empt raids fire for THIS, not stand-closing)
         waveAsrc = sc.asrc,                           -- v0.1.218: the arrival's source - asrc=sim means waveEta IS the fight end (the bal<0 farmable moment)
+        crashTowerKey = sc.crash_tower_key,           -- v0.1.246: the wave's tower terminus; dies mid-commit -> the fsm_move_wave tripwire redecides
     }
     State.marchCasts, State.fsm = 0, "MOVE"
     State.moveSince = now(); State.moveTrack = nil
@@ -3171,6 +3244,15 @@ end
 local function fsm_move_wave(s)
     keen_cancel_check()   -- v0.1.216: a canceled keen re-arms the ladder (rearm -> keen), never a deep walk
     State.fog = enemy_snapshot()                       -- fresh risk for safe_rearm + the reposition check
+    -- v0.1.246 HOLD TRIPWIRE (TINKER_TOWER_DEATH_DESIGN.md): the committed wave's tower
+    -- terminus DIED - the wave pushes past it and nothing arrives at this stand. The run-57
+    -- law: geometry changes REDECIDE, never hold (this kills the 25s stale stand even when
+    -- the melt prediction missed the dispatch).
+    if s.crashTowerKey and Towers.Alive(State.towerTrack, s.crashTowerKey) == false then
+        logline("tower_died -> redecide lane=" .. tostring(s.lane or K.HOME_LANE))
+        State.spot = nil; State.fsm = "DECIDE"; State.moveSince = nil
+        return
+    end
     -- Note 3: a committed shove/wave walk had NO live risk re-check (Part A was camp-only), so it kept
     -- walking forward into a gank as risk rose (death at a decide-gate stand risk 0.31 that climbed past
     -- 0.42 during the long keen-to-mid-T1 + 1936u walk). Re-check the HERO's live fog-aware risk each
@@ -4861,6 +4943,6 @@ for cb_name, cb_fn in pairs(callbacks) do
     end
 end
 
-if LOG then LOG:info("Tinker brain v0.1.245 (INSTRUMENT CLEANUP after the flicker arc closed: run-62 + user confirm [flicker GONE visually; ext_move 0, gap=0 drumbeat 1 benign line, audits clean]. REMOVED the one-run diagnostic scaffolding: the mv src= issue log, the mv_intr cast-interrupt log, the ext_move rising-edge detector + State.wasRunning/lastOrderT. KEPT: move_to's src param [producer names ride State.lastMove.src for any future move-level diagnosis] and the two v0.1.244 arrival-epsilon guards [lane_go walk rung + move_stand: no order within WAVE_HOLD_EPS of the destination - THE fix]. W-CANCEL [v0.1.242] stays live [march_cancel, validated run-60]. NO behavior change vs .244. Suite 706/0.") end
+if LOG then LOG:info("Tinker brain v0.1.246 (TOWER REGISTRY + DEATH PREDICTION, study TINKER_TOWER_DEATH_STUDY.md + spec _DESIGN.md, user arc [the 25s stale mid wait after their T1 dies to creeps; generalized to ALL towers + an is-tower-X-alive flag; lib addition]. (1) NEW lib/towers.lua [pure, 7 tests]: Track [injected samples, EMA hp-slope, PERMANENT dead latch - towers never revive] / Alive [true|false|nil] / DeathEta [hp/slope while actively melting, floor 20 hp/s, stale 6s -> math.huge = conservative OFF for undamaged/healing/fogged]. (2) FEED: one pass per 2s scan over MapData.TOWERS static spots; missing-after-seen-alive = dead. (3) DECIDE EXCLUSION [the gone_by_arrival shape, NOT a veto]: a crash-clamp/crash_tower terminus predicted dead before travel + TOWER_DYING_MARGIN_S 3 -> mid covers=false cwhy=tower_dying, side verdict tower_dying; re-evaluated every 0.4s; once fallen, deep_era owns the lane as today. (4) HOLD TRIPWIRE [the run-57 law: geometry changes REDECIDE, never hold]: the spot carries crashTowerKey; the tower reading DEAD mid-commit -> tower_died -> redecide [kills the 25s even when the prediction missed]. enemy_lane_t1's live reads untouched [registry is additive]. Suite 713/0.") end
 
 return callbacks

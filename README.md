@@ -5,7 +5,7 @@ Current milestone is **farm-only**: it farms lanes and jungle and retreats when
 threatened; it never auto-engages enemy heroes. Defense, offense, and combo
 layers are planned follow-ups on the same shared `lib/`.
 
-Current build: **Tinker.lua v0.1.245**.
+Current build: **Tinker.lua v0.1.246**.
 
 ## What it does
 
@@ -37,7 +37,7 @@ Typical bot-game result on an itemless build: 450-600+ GPM with zero deaths.
 - `lib/` - hero-agnostic libraries: map/camp data, lane wave scanning and
   prediction, route planning, scheduling, navigation, escape and risk math,
   plus KV-generated game data. Pure logic is engine-stubbed and unit-tested.
-- `tools/run_tests.lua` - the offline test suite (706 tests, no game needed).
+- `tools/run_tests.lua` - the offline test suite (713 tests, no game needed).
 - `tools/parse_debuglog.lua` - the log analyzer (farm/depth audits, per-wave
   coverage, time and gold accounting). Useful when reporting issues.
 
@@ -80,7 +80,7 @@ to get it fixed.
 Offline development loop:
 
 ```
-lua tools/run_tests.lua          # pure-Lua suite, expect 706 passing
+lua tools/run_tests.lua          # pure-Lua suite, expect 713 passing
 luac -p Tinker/Tinker.lua        # byte-compile check
 ```
 

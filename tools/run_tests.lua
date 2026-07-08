@@ -4194,6 +4194,54 @@ describe("lib/map_data -- structure self-check", function()
     end)
 end)
 
+describe("lib/towers -- registry: alive flag + measured hp-slope death eta", function()
+    local TW = require("lib.towers")
+    local KEY = "tower1_mid@3"
+    it("melt extrapolation: eta ~= hp/rate", function()
+        local st = TW.Track({}, { { key = KEY, hp = 1800, alive = true } }, 100)
+        st = TW.Track(st, { { key = KEY, hp = 1700, alive = true } }, 102)   -- 50 hp/s
+        st = TW.Track(st, { { key = KEY, hp = 1600, alive = true } }, 104)
+        local eta = TW.DeathEta(st, KEY, 104)
+        assert_true(eta > 25 and eta < 40, "eta ~32s expected, got " .. tostring(eta))
+    end)
+    it("undamaged tower predicts huge", function()
+        local st = TW.Track({}, { { key = KEY, hp = 1800, alive = true } }, 100)
+        st = TW.Track(st, { { key = KEY, hp = 1800, alive = true } }, 102)
+        assert_eq(TW.DeathEta(st, KEY, 102), math.huge)
+    end)
+    it("dead latch is permanent (towers never revive)", function()
+        local st = TW.Track({}, { { key = KEY, hp = 500, alive = true } }, 100)
+        st = TW.Track(st, { { key = KEY, alive = false } }, 102)
+        st = TW.Track(st, { { key = KEY, hp = 1800, alive = true } }, 104)   -- mis-key/noise: ignored
+        assert_eq(TW.Alive(st, KEY), false)
+        assert_eq(TW.DeathEta(st, KEY, 104), 0)
+    end)
+    it("stale sample disables the prediction (fog decays to OFF)", function()
+        local st = TW.Track({}, { { key = KEY, hp = 1800, alive = true } }, 100)
+        st = TW.Track(st, { { key = KEY, hp = 1600, alive = true } }, 102)
+        assert_true(TW.DeathEta(st, KEY, 103) < math.huge, "fresh melt should predict")
+        assert_eq(TW.DeathEta(st, KEY, 112), math.huge)   -- 10s stale > stale_s 6
+    end)
+    it("never-sampled key: Alive nil, eta huge", function()
+        local st = {}
+        assert_eq(TW.Alive(st, KEY), nil)
+        assert_eq(TW.DeathEta(st, KEY, 100), math.huge)
+    end)
+    it("EMA smooths a noisy rate", function()
+        local st = TW.Track({}, { { key = KEY, hp = 2000, alive = true } }, 100)
+        st = TW.Track(st, { { key = KEY, hp = 1900, alive = true } }, 102)   -- 50 hp/s
+        st = TW.Track(st, { { key = KEY, hp = 1900, alive = true } }, 104)   -- 0 hp/s
+        local eta = TW.DeathEta(st, KEY, 104)
+        assert_true(eta < math.huge, "EMA slope (~25 hp/s) should still predict, got " .. tostring(eta))
+    end)
+    it("heal/backdoor regen resets the melt read", function()
+        local st = TW.Track({}, { { key = KEY, hp = 1000, alive = true } }, 100)
+        st = TW.Track(st, { { key = KEY, hp = 900, alive = true } }, 102)
+        st = TW.Track(st, { { key = KEY, hp = 1100, alive = true } }, 104)   -- healing up
+        assert_eq(TW.DeathEta(st, KEY, 104), math.huge)
+    end)
+end)
+
 ----------------------------------------------------------------------------
 -- REPORT
 ----------------------------------------------------------------------------
