@@ -4194,6 +4194,43 @@ describe("lib/map_data -- structure self-check", function()
     end)
 end)
 
+describe("lib/lane -- TrackFrontSpeed: measured front displacement (arc B)", function()
+    local L = require("lib.lane")
+    it("steady march measures ~stat", function()
+        local tr, spd = L.TrackFrontSpeed({}, "mid:enemy", { x = 0, y = 0 }, 100)
+        assert_eq(spd, nil, "first sample has no dt")
+        tr, spd = L.TrackFrontSpeed(tr, "mid:enemy", { x = 650, y = 0 }, 102)     -- 325 u/s
+        tr, spd = L.TrackFrontSpeed(tr, "mid:enemy", { x = 1300, y = 0 }, 104)
+        assert_true(spd and spd > 300 and spd < 350, "expected ~325, got " .. tostring(spd))
+    end)
+    it("a held wave decays toward 0 and recovers within ~2 samples", function()
+        local tr, spd = L.TrackFrontSpeed({}, "k", { x = 0, y = 0 }, 100)
+        tr, spd = L.TrackFrontSpeed(tr, "k", { x = 650, y = 0 }, 102)             -- marching
+        tr, spd = L.TrackFrontSpeed(tr, "k", { x = 650, y = 0 }, 104)             -- held
+        tr, spd = L.TrackFrontSpeed(tr, "k", { x = 650, y = 0 }, 106)
+        tr, spd = L.TrackFrontSpeed(tr, "k", { x = 655, y = 0 }, 108)
+        assert_true(spd and spd < 80, "held wave should read <80, got " .. tostring(spd))
+        tr, spd = L.TrackFrontSpeed(tr, "k", { x = 1305, y = 0 }, 110)            -- released
+        tr, spd = L.TrackFrontSpeed(tr, "k", { x = 1955, y = 0 }, 112)
+        assert_true(spd and spd > 200, "release should recover within ~2 samples, got " .. tostring(spd))
+    end)
+    it("a front JUMP (new wave replaced the old) resets the measurement", function()
+        local tr, spd = L.TrackFrontSpeed({}, "k", { x = 0, y = 0 }, 100)
+        tr, spd = L.TrackFrontSpeed(tr, "k", { x = 650, y = 0 }, 102)
+        tr, spd = L.TrackFrontSpeed(tr, "k", { x = 4000, y = 0 }, 104)            -- 1675 u/s = a jump
+        assert_eq(spd, nil, "jump resets; no speed until a fresh dt")
+        tr, spd = L.TrackFrontSpeed(tr, "k", { x = 4650, y = 0 }, 106)
+        assert_true(spd and spd > 300, "fresh measurement after the reset")
+    end)
+    it("stale sample returns nil (fog)", function()
+        local tr, spd = L.TrackFrontSpeed({}, "k", { x = 0, y = 0 }, 100)
+        tr, spd = L.TrackFrontSpeed(tr, "k", { x = 650, y = 0 }, 102)
+        assert_true(spd ~= nil)
+        local _, spd2 = L.TrackFrontSpeed(tr, "k", nil, 112)                      -- no front for 10s
+        assert_eq(spd2, nil)
+    end)
+end)
+
 describe("lib/towers -- registry: alive flag + measured hp-slope death eta", function()
     local TW = require("lib.towers")
     local KEY = "tower1_mid@3"

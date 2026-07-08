@@ -305,6 +305,39 @@ function Lane.PredictMeeting(a, b)
     return { point = { x = a.pos.x + dx * f, y = a.pos.y + dy * f }, eta = gap / close }
 end
 
+---MEASURED front speed (arc B, the lane-freeze study): real lanes get held/frozen by the
+---enemy laner - a body-blocked wave's stat speed (NPC.GetMoveSpeed) reads 325 while its
+---displacement is ~0, so every stat-fed meeting eta is optimistic by the whole freeze.
+---Pure state-in/state-out tracker (the Towers.Track pattern): EMA of the front's
+---displacement per key across scan ticks. A front JUMP beyond opts.jump (700 u/s) = a new
+---wave replaced the old -> the measurement resets. A sample staler than opts.stale_s (6)
+---or a nil front (fog) returns nil - the caller falls back to the stat.
+---@return table track, number|nil speed
+function Lane.TrackFrontSpeed(track, key, front, now, opts)
+    track = track or {}
+    local e = track[key]
+    if front then
+        if e and e.t and now > e.t then
+            local dx, dy = front.x - e.x, front.y - e.y
+            local inst = math.sqrt(dx * dx + dy * dy) / (now - e.t)
+            if inst > ((opts and opts.jump) or 700) then
+                track[key] = { x = front.x, y = front.y, t = now }   -- new wave: reset
+            else
+                local a = (opts and opts.ema) or 0.5
+                e.ema = e.ema and (a * e.ema + (1 - a) * inst) or inst
+                e.x, e.y, e.t = front.x, front.y, now
+            end
+        elseif not e then
+            track[key] = { x = front.x, y = front.y, t = now }
+        end
+        e = track[key]
+    end
+    if e and e.ema and e.t and now - e.t <= ((opts and opts.stale_s) or 6) then
+        return track, e.ema
+    end
+    return track, nil
+end
+
 -- ---- clash equilibrium + intercept ---------------------------------------
 
 ---equilibrium + movement prediction for a lane. contact = where the fronts meet; each side's

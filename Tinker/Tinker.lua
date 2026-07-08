@@ -108,6 +108,7 @@ local K = {
     TOWER_ALIVE_R     = 300,                       -- v0.1.105 lane-prioritization: an enemy tower this near a static T1 spot = that T1 is alive (towers don't move; T1<->T2 mid are ~2200u apart so no cross-match). ponytail ceiling.
     TOWER_DYING_MARGIN_S = 3,                      -- v0.1.246 (TINKER_TOWER_DEATH_DESIGN.md): a crash tower predicted dead before our arrival + this margin excludes the wave this decide (cwhy/verdict tower_dying) - the wave lingers briefly after the fall, so arrival within eta+margin is still farmable.
     ENGAGE_MANA_WAIT_S   = 4,                      -- v0.1.249 P3: raw mana a sip short of March at the wave (cd done, effective covers) holds this long for the bottle/regen instead of bailing the whole trip home (run-64 S4: a doomed dispatch cast zero W).
+    HELD_CLOSING_MIN     = 80,                     -- v0.1.250 arc B: an enemy wave whose MEASURED speed reads at/below this is HELD/frozen (asrc=held trace tag; the honest eta already does the excluding). Run-64: mid moved <100 u/s for 25% of the run.
     TOWER_RISK_RADIUS = 900, TOWER_RISK_WEIGHT = 0.7, TOWER_ATTACK_RANGE = 700,   -- Deep 1 (v0.1.76 PLATEAU): the live-abort positional veto. A live enemy tower within ATTACK_RANGE = full WEIGHT (decisively unsafe), tapering linearly to 0 at RADIUS. WEIGHT 0.7 > SHOVE_SAFE_RISK 0.35 so lane_unsafe trips within ~800; catches the v0.1.73 death stand (791u -> 0.38).
     TOWER_SAFE_MARGIN = 200,                       -- note 1 / option A (v0.1.159): a STAND must sit at least ATTACK_RANGE + this from every alive enemy tower (900 = the taper edge, risk 0). The old risk<0.35 gate stopped clamping at ~800 = "barely outside" the tower. March reach (1200) still covers 300 past the tower from 900, so the tower-border W-farm is intact. Stricter than the live abort = the SAFE direction of the v0.1.148 consistency rule.
     FRONTIER_CACHE_S  = 0.5,                       -- structure-list cache for frontier_excess (enumerating every call inside the 40-step clamp loop is waste)
@@ -1332,7 +1333,7 @@ local function anchor_candidates(include_creeps)
                     local scan = State.laneScan and State.laneScan[Lane._assign_lane({ x = p.x, y = p.y })]
                     local aw = scan and scan.ally_wave
                     if aw then
-                        local s2 = aw.speed
+                        local s2 = aw.speed_measured or aw.speed   -- v0.1.250 arc B: the DISPLACEMENT when tracked (the .236 intent - aw.speed was the stat all along)
                         if not s2 then
                             for _, cc in ipairs(aw.creeps or {}) do
                                 if cc.speed and (not s2 or cc.speed > s2) then s2 = cc.speed end
@@ -1708,10 +1709,42 @@ end
 -- max live member speed of a wave (est waves carry .speed from the mirror; real waves from members).
 local function wave_speed(w)
     if not w then return nil end
+    -- v0.1.250 arc B (TINKER_LANE_FREEZE_STUDY.md): the MEASURED displacement beats the stat -
+    -- a body-blocked wave reads 325 by stat while standing still (run-64: mid moved <100 u/s
+    -- for 25% of the run; arrivals ran +2..25s late on the fantasy closings). Floor 20 keeps
+    -- PredictMeeting alive (close > 0), so a HELD wave yields an honest HUGE eta and the
+    -- existing far_wave/slack economics jungle it - no new veto.
+    if w.speed_measured then return math.max(20, w.speed_measured) end
     if w.speed then return w.speed end
     local s
     for _, cc in ipairs(w.creeps or {}) do if cc.speed and (not s or cc.speed > s) then s = cc.speed end end
     return s
+end
+
+-- v0.1.250 arc B: stamp measured front speeds onto the wave records of a fresh scan. Only
+-- REAL fronts are tracked (a mirrored estimate's front derives from OUR wave - measuring it
+-- is circular); the measurement is capped at the stat (noise cannot exceed the possible).
+local function annotate_measured(lanes)
+    if not lanes then return lanes end
+    for _, ln in ipairs({ "top", "mid", "bot" }) do
+        local s = lanes[ln]
+        if s then
+            for side, w in pairs({ enemy = s.enemy_wave, ally = s.ally_wave }) do
+                if w and w.front and not w.estimated then
+                    local spd
+                    State.frontTrack, spd = Lane.TrackFrontSpeed(State.frontTrack, ln .. ":" .. side, w.front, now())
+                    if spd then
+                        local stat = w.speed
+                        if not stat then
+                            for _, cc in ipairs(w.creeps or {}) do if cc.speed and (not stat or cc.speed > stat) then stat = cc.speed end end
+                        end
+                        w.speed_measured = math.min(spd, stat or 325)
+                    end
+                end
+            end
+        end
+    end
+    return lanes
 end
 
 -- arm_overlay: true (from the bind) keeps the visual overlay up for TEST_OVERLAY_SEC; the automatic
@@ -1728,6 +1761,7 @@ local function run_lane_scan(arm_overlay)
         game_time = now(),   -- fog-fill: ExpectedWave estimate for unseen lanes. NOTE now()=GameRules.GetGameTime(); confirm it is the GAME CLOCK (0:00=first wave) vs engine time in-client (affects wave parity).
         paths = lane_paths(),   -- Piece 1.5: fogged enemy waves get position/speed via the arc-length mirror
     })
+    annotate_measured(lanes)   -- v0.1.250 arc B: measured front speeds ride the records
     State.laneScan = lanes
     if arm_overlay then State.laneScanUntil = now() + K.TEST_OVERLAY_SEC end
     -- v0.1.246 tower registry feed (TINKER_TOWER_DEATH_DESIGN.md): one sampling pass per
@@ -2190,6 +2224,9 @@ local function schedule_ctx(lanes)
     local arrival, asrc
     if pm and visible then
         arrival, asrc = now() + pm.eta, "kin"
+        -- v0.1.250 arc B: a held/frozen enemy wave names itself (the measured-speed eta is
+        -- already honest - huge - so the far_wave/slack economics own the exclusion).
+        if (wave_speed(ew) or 325) <= K.HELD_CLOSING_MIN then asrc = "held" end
     elseif visible then
         arrival, asrc = now(), "vis"          -- visible but front/speed incomplete: it is here
     elseif State.laneWaveT.mid then
@@ -2449,7 +2486,8 @@ local function side_wave_ctx(lane, s)
     -- there must not veto a possibly-healthy fogged wave here; estimates never veto.
     if visible and eff_hp < K.SHOVE_THIN_EFFHP then return nil, "thin" end
     local arrival, asrc
-    if pm and visible then arrival, asrc = now() + pm.eta, "kin"
+    if pm and visible then
+        arrival, asrc = now() + pm.eta, ((wave_speed(ew) or 325) <= K.HELD_CLOSING_MIN) and "held" or "kin"   -- v0.1.250 arc B: frozen sides name themselves too
     elseif visible then arrival, asrc = now(), "vis"
     elseif stamp_fresh then                                  -- PHASE 2: measured cadence beats the unstamped mirror (mid ladder parity, run-8)
         arrival, asrc = Schedule.NextWaveArrival(now(), K.WAVE_PERIOD, K.WAVE_PHASE, stampT), "stamp"
@@ -2654,6 +2692,7 @@ local function fsm_decide()
             tp = keen_tp(), game_time = now(),   -- v0.1.230: ladder-aware pricing
             paths = lane_paths(),   -- Piece 1.5: mirrored fogged waves (position/speed) for the meeting/decide reads
         })
+        annotate_measured(lanes)   -- v0.1.250 arc B: measured front speeds for the meeting math
         local sc = schedule_ctx(lanes)
         local d = sc and Schedule.Plan(sc.plan) or nil
         -- (the old near_due flip - jungle when slack<travel_to_mid -> shove - is folded into the
@@ -3314,6 +3353,19 @@ local function fsm_move_wave(s)
         local grace = (d0 <= K.WAVE_ENGAGE_RANGE) and K.WAVE_WAIT_GRACE_VIS or K.WAVE_WAIT_GRACE
         local due = (s.waveEta and (s.waveEta + grace)) or (State.emptySince + K.WAVE_WAIT_GRACE)
         if now() > due then
+            -- v0.1.250 arc B3 (run-64: 14-18s stands on FROZEN waves, "Wait wave 0s"): AT THE
+            -- STAND an overdue wave CONVERTS to jungle instead of extending - suppress briefly
+            -- so the planner takes a near camp; the lane re-competes every decide and re-
+            -- dispatches the moment the wave shows or the freeze releases (the measured-speed
+            -- read normalizes within ~2 scans). Tethered/far holds keep the extend below
+            -- (their step-out clocks own lateness; no vision claim there).
+            if d0 <= K.WAVE_ENGAGE_RANGE then
+                logline(string.format("overdue_convert lane=%s over=%.1f", tostring(s.lane or K.HOME_LANE),
+                    now() - (s.waveEta or State.emptySince or now())))
+                if s.shove then suppress_shove(s.lane, now() + K.SHOVE_STUCK_S) end
+                State.spot = nil; State.fsm = "DECIDE"; State.moveSince = nil
+                return
+            end
             local nxt = Schedule.NextWaveArrival(now(), K.WAVE_PERIOD, K.WAVE_PHASE, State.laneWaveT[s.lane or K.HOME_LANE])   -- PHASE 2: the hold's own lane cadence (side holds used MID's stamp before - wrong lane phase)
             if nxt and (nxt - now()) <= K.WAVE_HOLD_NEXT then
                 s.waveEta = nxt
@@ -5012,6 +5064,6 @@ for cb_name, cb_fn in pairs(callbacks) do
     end
 end
 
-if LOG then LOG:info("Tinker brain v0.1.249 (ARC A: RETURN-LEG TRANSPORT, the run-64 real-lobby sightings S1+S4, one mana-boundary version. P1 RETURN REARM RESERVE: try_rearm gains a reserve param; fsm_return passes the keen cost instead of the escape buffer [teleporting HOME double-booked the reserve - walk_home x24 vs rearm_reset_keen x3]. P2 RETURN WAIT-VS-WALK: when SAFE [the resume-path risk gates] and the teleport is close [keen cd ending, or a small mana deficit at live regen - bottle sips accelerate], HOLD re-evaluated per tick instead of the cross-map walk [return_wait log; no run-57 deadlock class - keen home always has a target]. P3 THE MANA-SIP BELT: at a wave, March cd DONE + raw a sip short + effective covers -> ready() [RAW castability] read false and the old belt misread it as rearm_unfundable, burning the whole trip [run-64: keen to a visible 5-creep wave, zero W, trekked home]; now HOLD up to ENGAGE_MANA_WAIT_S 4 [engage_wait reason=mana_sip; bottle_tick sips per tick], past the cap the old bail runs [mana_sip_timeout]. Suite 713/0.") end
+if LOG then LOG:info("Tinker brain v0.1.250 (ARC B: LANE-FREEZE HONESTY, study TINKER_LANE_FREEZE_STUDY.md, run-64 S3+S5 [14-18s mid stands, 'Wait wave 0s'; real lanes moved <100 u/s 25% of the run while NPC.GetMoveSpeed reads the STAT 325 = every meeting eta closed at fantasy speeds]. (1) MEASURED FRONT SPEED: NEW Lane.TrackFrontSpeed [pure EMA of front displacement per lane/side, jump-reset on wave replacement, fog-stale nil; 4 tests] fed at BOTH scan sites [annotate_measured]; wave_speed prefers the measurement [floored 20 so PredictMeeting stays alive] -> a HELD wave yields an honest HUGE eta and the EXISTING far_wave/slack economics jungle it, no new veto; consumers upgraded free [meet_eta, gone_by_arrival, the .236 cexcl drift - which read the stat all along]. asrc=held names frozen closings [HELD_CLOSING_MIN 80]. (2) OVERDUE-CONVERT [B3, the fogged backstop]: AT THE STAND an overdue wave [the existing eta + WAVE_WAIT_GRACE_VIS 4 clock] converts to jungle [overdue_convert log, brief suppression, re-competes each decide] instead of the +12s wave_wait extend; tethered/far holds keep the extend. Includes arc A [.249]. Suite 717/0.") end
 
 return callbacks
