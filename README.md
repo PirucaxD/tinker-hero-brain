@@ -5,7 +5,7 @@ Current milestone is **farm-only**: it farms lanes and jungle and retreats when
 threatened; it never auto-engages enemy heroes. Defense, offense, and combo
 layers are planned follow-ups on the same shared `lib/`.
 
-Current build: **Tinker.lua v0.1.246**.
+Current build: **Tinker.lua v0.1.247**.
 
 ## What it does
 

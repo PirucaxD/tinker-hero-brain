@@ -532,8 +532,18 @@ local function kill_threat_w(h)
 end
 
 local function enemy_risk_at(pt)
+    if not pt then return 0 end
     local snap = State.fog or enemy_snapshot()   -- per-decide snapshot (set in fsm_decide); avoids rebuilding it ~40x
-    return Escape.FogProximityRisk(snap, pt, {
+    -- v0.1.247 CRASH FIX (found by a tester of the public mirror, field-verified): several
+    -- callers pass a PLAIN {x,y} table (safe_stand_for's raid_safe stand from Nav.SafeDest/
+    -- snap_walkable, lane_unsafe's pos, lane_go dests) while FogProximityRisk calls
+    -- pt:Distance2D - engine-Vector only. With any hero in the snapshot (visible OR fresh-
+    -- fogged) that throws escape.lua:858 EVERY decide -> fsm_decide aborts before picking ->
+    -- FSM frozen in DECIDE at ~50 errors/s. Our demo runs never saw it (no enemy heroes =
+    -- empty snapshot = the loop never ran). Normalize ONCE here, the same idiom as
+    -- enemy_tower_risk - one guard at the chokepoint covers every caller.
+    local p = Vector(pt.x, pt.y, 0)
+    return Escape.FogProximityRisk(snap, p, {
         risk_radius = K.RISK_RADIUS, fog_ms = K.FOG_MS,
         fog_spread = K.FOG_SPREAD, age_cap = K.FOG_AGE_CAP, now = now,
         weight_fn = kill_threat_w })
@@ -4943,6 +4953,6 @@ for cb_name, cb_fn in pairs(callbacks) do
     end
 end
 
-if LOG then LOG:info("Tinker brain v0.1.246 (TOWER REGISTRY + DEATH PREDICTION, study TINKER_TOWER_DEATH_STUDY.md + spec _DESIGN.md, user arc [the 25s stale mid wait after their T1 dies to creeps; generalized to ALL towers + an is-tower-X-alive flag; lib addition]. (1) NEW lib/towers.lua [pure, 7 tests]: Track [injected samples, EMA hp-slope, PERMANENT dead latch - towers never revive] / Alive [true|false|nil] / DeathEta [hp/slope while actively melting, floor 20 hp/s, stale 6s -> math.huge = conservative OFF for undamaged/healing/fogged]. (2) FEED: one pass per 2s scan over MapData.TOWERS static spots; missing-after-seen-alive = dead. (3) DECIDE EXCLUSION [the gone_by_arrival shape, NOT a veto]: a crash-clamp/crash_tower terminus predicted dead before travel + TOWER_DYING_MARGIN_S 3 -> mid covers=false cwhy=tower_dying, side verdict tower_dying; re-evaluated every 0.4s; once fallen, deep_era owns the lane as today. (4) HOLD TRIPWIRE [the run-57 law: geometry changes REDECIDE, never hold]: the spot carries crashTowerKey; the tower reading DEAD mid-commit -> tower_died -> redecide [kills the 25s even when the prediction missed]. enemy_lane_t1's live reads untouched [registry is additive]. Suite 713/0.") end
+if LOG then LOG:info("Tinker brain v0.1.247 (STUCK-IN-DECIDE CRASH FIX, found + field-verified by a tester of the public mirror: enemy_risk_at forwarded plain {x,y} tables [raid_safe stand, lane_unsafe pos, lane_go dests] to FogProximityRisk, which calls pt:Distance2D [engine-Vector only] -> with ANY hero in the fog snapshot [visible or fresh-fogged] escape.lua:858 threw EVERY decide -> fsm_decide aborted before picking -> FSM frozen in DECIDE at base, ~50 errors/s, the minute-long freeze. Our demo/bot runs never hit it [no enemy heroes = empty snapshot = the risk loop never ran - runs 44-63 all masked]. FIX = normalize at the chokepoint [nil guard + Vector wrap in enemy_risk_at, the enemy_tower_risk idiom] - one guard covers every caller; the pre-wrapped call sites stay harmless. NO other change vs v0.1.246 [tower registry + death prediction unchanged, awaiting its melt scenario]. Suite 713/0.") end
 
 return callbacks
