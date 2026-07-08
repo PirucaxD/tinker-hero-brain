@@ -427,14 +427,16 @@ end
 -- ONE guard at the chokepoint covers every caller: skip when the target is within MOVE_DEDUP_DIST of
 -- the last issued move AND that order is younger than MOVE_DEDUP_S (re-assert ~2x/s so a swallowed
 -- order self-heals; a genuinely NEW destination >75u away still issues immediately).
-local function move_to(pos)
+local function move_to(pos, src)
     local lm = State.lastMove
     if lm and now() - lm.t < K.MOVE_DEDUP_S then
         local dx, dy = pos.x - lm.x, pos.y - lm.y
         if dx * dx + dy * dy <= K.MOVE_DEDUP_DIST * K.MOVE_DEDUP_DIST then return true end   -- already moving there
     end
     if issue(UO.DOTA_UNIT_ORDER_MOVE_TO_POSITION, nil, nil, pos) then
-        State.lastMove = { x = pos.x, y = pos.y, t = now() }
+        -- src (v0.1.242) names the producer; kept as documentation + for any future move-level
+        -- diagnosis (the v0.1.244 flicker took two instrument versions to name - never again).
+        State.lastMove = { x = pos.x, y = pos.y, t = now(), src = src }
         return true
     end
     return false
@@ -2829,7 +2831,7 @@ local function fsm_decide()
            or frontier_excess({ x = me.x, y = me.y }) > 0 then
             local w = protected_wait_spot({ x = me.x, y = me.y })
             if me:Distance(Vector(w.x, w.y, me.z)) > K.WAVE_HOLD_EPS then
-                move_to(Vector(w.x, w.y, me.z))
+                move_to(Vector(w.x, w.y, me.z), "idle_retreat")
             end
         end
         -- v0.1.163 (user): the none-idle is a deliberate wait too (suppression / no target fits)
@@ -3119,7 +3121,14 @@ local function lane_go(dest, raid)
                 return "wait_keen"
             end
         end
-        move_to(sv); return "walk"
+        -- v0.1.244 THE AT-DESTINATION SHUFFLE FIX (run-61, named by the .242/.243 instruments +
+        -- the platform order log): already within the arrival epsilon = issue NOTHING. The old
+        -- 0.5s same-target re-assert kept a stale MOVE order alive at the stand (51 identical
+        -- orders to one spot, mv gap=0 age=0.53 drumbeats), and the engine RESUMES that stale
+        -- order after every cast completes (ext_move ages 2.87-3.2s = the rearm+cast cycle) -
+        -- the user's ~1Hz "issue a movement and cancel it" while waiting in lane.
+        if me:Distance(sv) <= K.WAVE_HOLD_EPS then return "walk" end
+        move_to(sv, "lane_walk"); return "walk"
     end
     local rungs = Nav.Ladder(me:Distance(sv), {
         keened = State.keenedSpot, keen_ready = ready(State.keen), keen_min_gain = K.KEEN_TRAVEL_MIN,
@@ -3294,7 +3303,7 @@ local function fsm_move_wave(s)
                     -- v0.1.206: a raid-capable leg ALWAYS walks (the hold is local by construction
                     -- above; the keen is preserved for the direct creep hop). Non-raid legs keep
                     -- the ladder (their engage is a walk-in, the keen is not needed later).
-                    if raidok then move_to(hv) else lane_go(hv) end
+                    if raidok then move_to(hv, "tether_hold") else lane_go(hv) end
                 end
                 return
             end
@@ -3466,7 +3475,7 @@ local function fsm_move_wave(s)
             if me:Distance(hv) > K.WAVE_HOLD_EPS then
                 -- v0.1.207: raid legs ALWAYS walk (local by construction above; keen preserved
                 -- for the direct creep hop). Non-raid legs keep the ladder.
-                if raidok then move_to(hv) else lane_go(hv) end
+                if raidok then move_to(hv, "tether_hold_live") else lane_go(hv) end
             end
             return
         end
@@ -3574,7 +3583,8 @@ local function fsm_move()
         end
     end
     if try_travel_blink(stand) then return end   -- blink the remaining gap when safe + ready
-    move_to(stand)
+    if origin(State.hero):Distance(stand) <= K.WAVE_HOLD_EPS then return end   -- v0.1.244: at the stand = no order (the at-destination shuffle fix, same as lane_walk)
+    move_to(stand, "move_stand")
 end
 
 -- Wave ENGAGE: Tinker Marches the LIVE creep cluster from the safe stand. Re-track the wave each tick
@@ -3585,6 +3595,24 @@ local function fsm_engage_wave(s)
     State.fog = enemy_snapshot()                       -- fresh risk for safe_rearm
     local live = update_wave_spot(s)
     if not live then                                    -- wave gone (cleared / left): brief grace then done
+        -- v0.1.242 W-CANCEL (user feature): a March still WINDING UP (order issued, cast not
+        -- fired - the turn + 0.53s cast point window) would land on nothing now that the last
+        -- creep died. Cancel the order (a move to self interrupts the wind-up) and keep the
+        -- ~160-190 mana. Already-fired = uncancelable (robots out): resolve the count as usual.
+        -- issue() swallowed by ORDER_GAP -> pending stays, retry next tick (the .234 lesson).
+        local mp0 = State.marchPending
+        if mp0 then
+            if (not ready(State.march)) or cd_remaining(State.march) > mp0.cdBefore + 0.05 then
+                State.marchCasts = State.marchCasts + 1; State.marchPending = nil
+                logline("march cast=" .. State.marchCasts)
+            else
+                local me0 = origin(State.hero)
+                if issue(UO.DOTA_UNIT_ORDER_MOVE_TO_POSITION, nil, nil, me0) then   -- bypass move_to: the dedup must not eat the cancel
+                    State.marchPending = nil
+                    logline("march_cancel reason=empty src=wave")
+                end
+            end
+        end
         State.emptySince = State.emptySince or now()
         if now() - State.emptySince > K.ENGAGE_EMPTY_GRACE then
             -- cadence anchor: NextWaveArrival treats this as the ARRIVAL phase. Best source first:
@@ -3697,7 +3725,7 @@ local function fsm_engage_wave(s)
                     -- lane destination - a deep aim must never nudge him past the line.
                     local dok2 = s.shove and ((State.keen and Ability.GetLevel and Ability.GetLevel(State.keen)) or 0) >= 2
                     if not lane_unsafe(sp) and (dok2 or (stand_depth(sp) <= K.WALK_DEPTH_MAX and lane_leash_ok(sp))) then   -- v0.1.202: dok2 (raid-capable shove) exempts the leash for the in-engage nudge too
-                        move_to(Vector(sp.x, sp.y, me.z))
+                        move_to(Vector(sp.x, sp.y, me.z), "stepin_w")
                         State.waitInfo = { why = "step-in W", t = now() }
                         stepped = true
                     end
@@ -3821,7 +3849,7 @@ local function fsm_engage_stack(s)
     end
     if now() < s.aggroAt then
         State.waitInfo = { why = string.format("stack %ds", math.max(0, math.floor(s.aggroAt - now()))), t = now() }
-        if me:Distance(s.standSpot.stand) > K.WAVE_HOLD_EPS then move_to(s.standSpot.stand) end
+        if me:Distance(s.standSpot.stand) > K.WAVE_HOLD_EPS then move_to(s.standSpot.stand, "engage_hold") end
         return
     end
     if not s.aggroed then
@@ -3844,7 +3872,7 @@ local function fsm_engage_stack(s)
         local dx, dy = fp.x - s.center.x, fp.y - s.center.y
         local dl = math.sqrt(dx * dx + dy * dy); if dl < 1 then dl = 1 end
         local r = K.STACK_STAND_DIST + K.STACK_FLEE_DIST
-        move_to(Vector(s.center.x + dx / dl * r, s.center.y + dy / dl * r, me.z))
+        move_to(Vector(s.center.x + dx / dl * r, s.center.y + dy / dl * r, me.z), "stack_drag")
     end
     State.waitInfo = { why = "stack drag", t = now() }
 end
@@ -3892,6 +3920,22 @@ local function fsm_engage()
         s.campEhp = s.campEhp or live_camp_ehp(s, neutrals)   -- F1: snapshot the FULL (stacked) ehp once for the stack-aware budget
     else
         State.emptySince = State.emptySince or now()
+        -- v0.1.242 W-CANCEL (camps, user feature): same as the wave cancel, but only past the
+        -- MIN_CASTS_BEFORE_EMPTY debounce - creeps aggro OUT of the box after the first cast
+        -- (the A-flicker below), and canceling on that false empty would drop a real W.
+        local mp0 = State.marchPending
+        if mp0 and (State.marchCasts or 0) >= K.MIN_CASTS_BEFORE_EMPTY then
+            if (not ready(State.march)) or cd_remaining(State.march) > mp0.cdBefore + 0.05 then
+                State.marchCasts = State.marchCasts + 1; State.marchPending = nil
+                logline("march cast=" .. State.marchCasts)
+            else
+                local me0 = origin(State.hero)
+                if issue(UO.DOTA_UNIT_ORDER_MOVE_TO_POSITION, nil, nil, me0) then   -- bypass move_to: the dedup must not eat the cancel
+                    State.marchPending = nil
+                    logline("march_cancel reason=empty src=camp")
+                end
+            end
+        end
         -- A: don't abort on the FIRST occupancy flicker. Creeps aggro out of the camp box right after the
         -- first March, so a 1-cast read=empty bailed with the creeps still alive (got=6). Require at least
         -- MIN_CASTS_BEFORE_EMPTY fired Marches before honouring "empty" (a genuinely empty camp just wastes
@@ -4038,7 +4082,7 @@ local function fsm_return()   -- REFILL: Keen home -> Rearm to reset Keen -> wai
     -- re-teleports him outside again ("teleported outside the fountain"). When already close,
     -- WALK the last bit into the fountain instead of re-keening.
     if fpf and origin(h):Distance2D(fpf) <= K.FOUNTAIN_WALK_IN then
-        move_to(Vector(fpf.x, fpf.y, origin(h).z))
+        move_to(Vector(fpf.x, fpf.y, origin(h).z), "fountain_walkin")
         if now() - (State.lastWalkHomeLog or -99) > 2.0 then State.lastWalkHomeLog = now(); logline("return walk_in_fountain") end
         return
     end
@@ -4056,7 +4100,7 @@ local function fsm_return()   -- REFILL: Keen home -> Rearm to reset Keen -> wai
             -- mana climbed 85->227 - Keen was on CD and Rearm unaffordable, but the BLINK doctrine
             -- says a safe walk is a blinkable walk): hop toward the fountain, walk the rest.
             if not try_travel_blink(Vector(fp.x, fp.y, origin(h).z)) then
-                move_to(Vector(fp.x, fp.y, origin(h).z))
+                move_to(Vector(fp.x, fp.y, origin(h).z), "walk_home")
             end
             if now() - (State.lastWalkHomeLog or -99) > 2.0 then   -- throttle: was logged every tick (632x); the over-return root is a separate (designed) fix
                 State.lastWalkHomeLog = now()
@@ -4817,6 +4861,6 @@ for cb_name, cb_fn in pairs(callbacks) do
     end
 end
 
-if LOG then LOG:info("Tinker brain v0.1.241 (PHASE-2 SIDE ANTICIPATION, spec TINKER_SIDE_ANTICIPATION_DESIGN.md, kills study R3: (1) PER-LANE CADENCE TABLE State.laneWaveT{mid,top,bot} - mid reads .mid [byte-equivalent], engage exits stamp THEIR lane [the .225 shared-slot guard dissolves]. (2) STAMP ANTICIPATION: a fogged side lane with a FRESH stamp [SIDE_STAMP_MAX_S 60 = 2 periods] dispatches like mid [asrc=stamp, crash=s.meeting + lane-T1 clamp, composition=ExpectedWave; stamp BEATS unstamped mirror kinematics per the mid ladder, run-8]; stale stamp = verdict stale. (3) REAL-READS-ONLY thin: an estimated composition never vetoes a lane [the mirror copies OUR paired wave - a remnant there must not kill a healthy fogged wave]; gone was already real-only. Kinest staleness = by construction [mirror rebuilt each 2s scan from our visible paired wave; clock estimates have no front and snub fogged]. (4) ssrc=vis|kin|kinest|stamp on side rows; per-lane hold cadence in fsm_move_wave [side holds used MID's stamp = wrong phase]. All risk/leash/dpts/window gates unchanged. Suite 706/0.") end
+if LOG then LOG:info("Tinker brain v0.1.245 (INSTRUMENT CLEANUP after the flicker arc closed: run-62 + user confirm [flicker GONE visually; ext_move 0, gap=0 drumbeat 1 benign line, audits clean]. REMOVED the one-run diagnostic scaffolding: the mv src= issue log, the mv_intr cast-interrupt log, the ext_move rising-edge detector + State.wasRunning/lastOrderT. KEPT: move_to's src param [producer names ride State.lastMove.src for any future move-level diagnosis] and the two v0.1.244 arrival-epsilon guards [lane_go walk rung + move_stand: no order within WAVE_HOLD_EPS of the destination - THE fix]. W-CANCEL [v0.1.242] stays live [march_cancel, validated run-60]. NO behavior change vs .244. Suite 706/0.") end
 
 return callbacks
