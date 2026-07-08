@@ -847,15 +847,19 @@ function Escape.FogProximityRisk(snapshot_or_me, pt, opts)
     else
         snap = Escape.FogSnapshot(snapshot_or_me, opts)
     end
+    -- component math, not pt:Distance2D: pt crosses the hero->lib boundary and callers have
+    -- passed plain {x,y} tables (the v0.1.247 stuck-in-DECIDE crash, found by a field tester);
+    -- .x/.y math accepts both plain tables and engine Vectors, and keeps this fn engine-free.
+    local function d2(a, b) local dx, dy = a.x - b.x, a.y - b.y return math.sqrt(dx * dx + dy * dy) end
     local best = 0
     for i = 1, #snap.heroes do
         local h = snap.heroes[i]
         local edge, conf
         if h.visible then
-            edge, conf = pt:Distance2D(h.pos), 1
+            edge, conf = d2(pt, h.pos), 1
         elseif h.age <= age_cap then
             local radius = h.age * fog_ms
-            edge = pt:Distance2D(h.pos) - radius
+            edge = d2(pt, h.pos) - radius
             if edge < 0 then edge = 0 end
             conf = fog_spread / (fog_spread + radius)
         end
