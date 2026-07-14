@@ -3873,6 +3873,16 @@ ThreatData.CANONICAL_MOD_ALIASES = {
     modifier_tusk_snowball_target              = "modifier_tusk_snowball_movement",  -- audit
     modifier_tusk_snowball                     = "modifier_tusk_snowball_movement",  -- manual (bare-name guard)
 
+    -- Sand King Burrowstrike. Canonical = modifier_sandking_burrowstrike
+    -- (THREATS_ON_SELF, ABILITY_TO_THREAT value). The LANDED victim-side stun
+    -- keeps the pre-rework legacy name modifier_sandking_impale (harvested
+    -- 2026-07-13, Tinker run-75 threat_unrecognized x11; KV has NO
+    -- sandking_impale ability - the kit ability is sandking_burrowstrike, so
+    -- the mod name is a Valve legacy leftover). Folding it buckets the
+    -- projectile-phase and landed-phase locks correctly (a save fired on the
+    -- line intercept suppresses a double dispatch when the stun lands).
+    modifier_sandking_impale                   = "modifier_sandking_burrowstrike",  -- harvest + KV-absence
+
     -- v0.5.140 Kez Grappling Claw. Canonical = _slow (the victim-side debuff that
     -- carries the harm profile + categorized close_gap + works reactively). The
     -- IN-FLIGHT _movement modifier (on Kez during the pull, modseen-confirmed) is

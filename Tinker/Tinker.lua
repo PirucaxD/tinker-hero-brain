@@ -202,6 +202,7 @@ local K = {
     CHANNEL_GATE_MARGIN = 500,                       -- ARC E1: a channel start is deferred when a disabler-kit enemy is within its max disable cast range + this (they close ground during the 1.2-2.93s channel; calibrate off channel_defer vs missed-rearm idle)
     CHANNEL_GATE_HORIZON = 3.0,                      -- E2 final review: readiness is judged at now()+this (covers the 2.93s Keen channel) - a breaker coming off cd DURING our channel still breaks it
     CHANNEL_DEFER_BAIL_S = 4.0,                      -- run-75: a wave engage whose Rearm the gate has deferred this long (parked disabler) bails + suppresses instead of standing (the .239 never-hold law)
+    CRASH_STICKY_S       = 10.0,                     -- run-76: a crash-our-tower flag seen by the 2s scan counts as crashing for this long (the instantaneous flag flickers mid-fight; decides sampled false instants and the 415g bot T2 wave went undefended)
     DISPATCH_HP_MIN     = 0.50,                      -- case-file #2 (run-72 t=445): a due shove below this HP fraction recovers first - PANIC_HP 0.40 fires on arrival otherwise (keen + ~50s donated); fed to Schedule.Plan as ctx.min_hp_frac
     LASER_MANA_FB       = 95,                         -- Laser mana fallback (Liquipedia ~95-120); abil_mana reads the real cost, this is only used if that read fails
     LASER_DMG           = { 75, 150, 225, 300 },      -- pure damage per Laser level (lib/ability_data, KV/Liquipedia-verified). PURE = ignores armor + magic resist, so a neutral is last-hittable iff its CURRENT hp <= this.
@@ -2188,6 +2189,15 @@ local function run_lane_scan(arm_overlay)
         local crash = "-"
         if s.clash and s.clash.crashing and s.clash.crash_tower then
             crash = (s.clash.crash_tower.team == State.team) and "allyTwr" or "enemyTwr"
+            -- v0.1.263 STICKY CRASH MEMORY (run-76 t~1860: an 8-9 creep ~415g wave ate our
+            -- bot T2 while every DECIDE sampled a crash=- instant - the flag flickers as the
+            -- creep fight moves the settle; swbot read slack/no_fit, defend never fired =
+            -- the run-58 watch item come true). This 2s scan runs unconditionally, so the
+            -- stamp remembers a crash BETWEEN decides; the defend conditions consume it.
+            if crash == "allyTwr" then
+                State.crashSeen = State.crashSeen or {}
+                State.crashSeen[ln] = now()
+            end
         end
         -- Piece 1.5 push model: per-lane BALANCE from the attrition sim (bal = net survivors of the
         -- current fight, + = OUR lane pushes; peta = predicted fight-end time). Instrumentation on
@@ -2523,7 +2533,18 @@ end
 -- locals): the main chunk sits against Lua's 200-locals-per-function limit.
 local E2 = {
     -- flee-worthy roles (reaction not conditional on owning a save)
-    FLEE_ROLES = { hard_disable = true, channel_on_me = true },
+    -- E3b: line_projectile added - a LANDED hook/skewer/burrowstrike-class stun on
+    -- self (recognized via the catalog or the sandking_impale alias) breaks contact
+    -- after, same as any landed disable. The pre-impact dodge stays Lina territory.
+    FLEE_ROLES = { hard_disable = true, channel_on_me = true, line_projectile = true },
+    -- E3b: Tinker-LOCAL threat entries the SHARED catalog deliberately omits.
+    -- modifier_stunned = the engine-generic landed stun: SK Burrowstrike aliases to
+    -- its canonical mod, but Venge Magic Missile and boulder-class hits land ONLY
+    -- this (run-75 harvest x13). The Lina line keeps it OUT of the shared table on
+    -- doctrine (reactively uncatchable - you are already stunned; her answer is
+    -- pre-arming). For Tinker the FLEE half is the whole value: escape-then-redecide
+    -- the moment it ends. extra=true skips the dispatcher (no phantom save chain).
+    EXTRA_THREATS = { modifier_stunned = { role = "hard_disable", extra = true } },
     -- modifier -> ability reverse map (built once, below)
     THREAT_TO_ABILITY = {},
 }
@@ -2870,7 +2891,11 @@ local function schedule_ctx(lanes)
                  -- (sim horizon) can flag our tower while the CURRENT meeting/stand still reads deep
                  -- enemy-side. Qualify on the stand being our-side (dpts == 0); when the wave really
                  -- approaches, the meeting recomputes near our tower and the defense fires there.
-                 defend_crash = (cl.crashing and cl.crash_tower and cl.crash_tower.team == State.team
+                 -- v0.1.263: OR the sticky stamp (crash seen by the 2s scan within
+                 -- CRASH_STICKY_S) - the instantaneous flag flickers mid-fight and every
+                 -- decide can sample a false instant (run-76 bot T2).
+                 defend_crash = (((cl.crashing and cl.crash_tower and cl.crash_tower.team == State.team)
+                                  or (State.crashSeen and now() - (State.crashSeen[K.HOME_LANE] or -1e9) < K.CRASH_STICKY_S))
                                  and dpts == 0) and true or false,
                  suppressed = shove_suppressed(K.HOME_LANE),
                  -- case-file #2 (run-72 t=445): the filler's need_recharge only converts SLACK
@@ -3025,8 +3050,12 @@ local function side_wave_ctx(lane, s)
                  -- to 410g, missed on slack/no_fit verdicts): SIDE defends are live now, same
                  -- qualification as mid (our tower + our-side stand = dpts 0). Plan's defend
                  -- rule outranks slack/far/gone but never unsafe/covers=false, unchanged.
-                 defend_crash = (s.clash and s.clash.crashing and s.clash.crash_tower
-                                 and s.clash.crash_tower.team == State.team and dpts == 0) and true or false,
+                 -- v0.1.263: OR the sticky stamp (see run_lane_scan) - run-76's bot crash
+                 -- flickered between decides and the defend never fired.
+                 defend_crash = (((s.clash and s.clash.crashing and s.clash.crash_tower
+                                   and s.clash.crash_tower.team == State.team)
+                                  or (State.crashSeen and now() - (State.crashSeen[lane] or -1e9) < K.CRASH_STICKY_S))
+                                 and dpts == 0) and true or false,
                  -- deliberately NOT fed (nil = rule inactive): filler (mid's lane-first
                  -- filler must not convert a SIDE near_due / force fountain trips),
                  -- suppressed (checked above, per-lane), recover_s (a side lane never owns
@@ -3036,8 +3065,10 @@ local function side_wave_ctx(lane, s)
         risk = srisk, dpts = dpts, wave_eta = arrival, asrc = asrc,
         meet_eta = (pm and (bal or 0) >= 0) and (now() + math.max(0, pm.eta)) or nil,
         travel = travel, gold = (ew and ew.gold) or 0, cwhy = cwhy,
-        defend = (s.clash and s.clash.crashing and s.clash.crash_tower
-                  and s.clash.crash_tower.team == State.team and dpts == 0) and true or false,
+        defend = (((s.clash and s.clash.crashing and s.clash.crash_tower
+                    and s.clash.crash_tower.team == State.team)
+                   or (State.crashSeen and now() - (State.crashSeen[lane] or -1e9) < K.CRASH_STICKY_S))
+                  and dpts == 0) and true or false,   -- v0.1.263: sticky OR, same as ctx.defend_crash above
         crash_tower_key = crash_twr_key,                    -- v0.1.246: rides the spot for the hold tripwire
     }
 end
@@ -5589,7 +5620,7 @@ function callbacks.OnModifierCreate(npc, modifier)
     if not mod_name then return end
     if mod_name:find("modifier_tinker_", 1, true) == 1 then return end   -- perf early-out (see above)
     local canon = (ThreatData.CanonicalMod and ThreatData.CanonicalMod(mod_name)) or mod_name
-    local entry = ThreatData.THREATS_ON_SELF[canon]
+    local entry = ThreatData.THREATS_ON_SELF[canon] or E2.EXTRA_THREATS[canon]   -- E3b: hero-local extras
     local is_self = (npc == State.hero)
     if not entry and not is_self then return end
     -- GetCaster deferred to here: one engine call saved on the common
@@ -5599,8 +5630,10 @@ function callbacks.OnModifierCreate(npc, modifier)
     if entry then
         E2.stamp_enemy_cast(canon, caster)                               -- observed cast anywhere visible
         if is_self then
-            defense_dispatcher:TrySaveSelf("threat_on_self", canon, caster,
-                                           nil, E2.THREAT_TO_ABILITY[canon], E2.on_save_fired)
+            if not entry.extra then                                      -- E3b: extras skip the dispatcher (no shared-catalog chain to resolve)
+                defense_dispatcher:TrySaveSelf("threat_on_self", canon, caster,
+                                               nil, E2.THREAT_TO_ABILITY[canon], E2.on_save_fired)
+            end
             if E2.FLEE_ROLES[entry.role] then E2.defense_flee(canon, caster) end   -- reaction not conditional on owning a save
         end
     else   -- (not entry) and is_self, by the early-return above
@@ -5647,6 +5680,6 @@ for cb_name, cb_fn in pairs(callbacks) do
     end
 end
 
-if LOG then LOG:info("Tinker brain v0.1.262 (run-75 fix, E1 first live exercise: THE DEFENSE PHASE - the Lina save stack wired in, ~200 lines of glue, zero lib changes to the stack itself. (1) DISPATCHER: Defense.New + the TrySaveSelf chokepoint over the hero-agnostic item save bodies [24 defensive items light up as bought; generic ETA resolver only; no per-threat hand overrides day one]; defense casts go through an UNTHROTTLED order core so they never lose to the farm-order rate guard [now the single PrepareUnitOrders site, the throttled path wraps it]. (2) THREAT EVENTS: the modifier-create handler routes catalogued threats on self to the dispatcher, uncatalogued enemy-hero threats to a throttled harvest line [the automatic E3 case file], and every observed enemy disable cast to a readiness stamp. (3) FLEE = ESCAPE THEN RE-DECIDE [user decision]: break contact with the existing escape chain, suppress the commit, next decide runs the normal planner; never a forced fountain trip, never offense. (4) THE GATE NARROWS: the E1 channel gate now consults the stamps [MIN-level cd, never over-claims unreadiness] plus probed live cooldown reads on visible enemies [one-shot probe line names whether the engine answers on enemy handles]; a disabler whose whole in-reach kit is on cd no longer defers channels. (5) E1 BUG FIX FOUND IN THE WORK: the gate iterated the fog snapshot WRAPPER instead of its heroes list - E1 was INERT since v0.1.257 and fires for real for the FIRST time this build; the over-deferral watch [margin 500 down first] is now live, not theoretical. One menu switch, default ON. Suite 727/0. Banner avoids quoting the new log tokens.") end
+if LOG then LOG:info("Tinker brain v0.1.264 (E3b harvest catalog: THE DEFENSE PHASE - the Lina save stack wired in, ~200 lines of glue, zero lib changes to the stack itself. (1) DISPATCHER: Defense.New + the TrySaveSelf chokepoint over the hero-agnostic item save bodies [24 defensive items light up as bought; generic ETA resolver only; no per-threat hand overrides day one]; defense casts go through an UNTHROTTLED order core so they never lose to the farm-order rate guard [now the single PrepareUnitOrders site, the throttled path wraps it]. (2) THREAT EVENTS: the modifier-create handler routes catalogued threats on self to the dispatcher, uncatalogued enemy-hero threats to a throttled harvest line [the automatic E3 case file], and every observed enemy disable cast to a readiness stamp. (3) FLEE = ESCAPE THEN RE-DECIDE [user decision]: break contact with the existing escape chain, suppress the commit, next decide runs the normal planner; never a forced fountain trip, never offense. (4) THE GATE NARROWS: the E1 channel gate now consults the stamps [MIN-level cd, never over-claims unreadiness] plus probed live cooldown reads on visible enemies [one-shot probe line names whether the engine answers on enemy handles]; a disabler whose whole in-reach kit is on cd no longer defers channels. (5) E1 BUG FIX FOUND IN THE WORK: the gate iterated the fog snapshot WRAPPER instead of its heroes list - E1 was INERT since v0.1.257 and fires for real for the FIRST time this build; the over-deferral watch [margin 500 down first] is now live, not theoretical. One menu switch, default ON. Suite 727/0. Banner avoids quoting the new log tokens.") end
 
 return callbacks

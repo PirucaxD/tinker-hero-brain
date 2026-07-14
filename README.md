@@ -6,7 +6,7 @@ reacts to enemy disables and threats with defensive item saves and escapes.
 It never auto-engages enemy heroes. Offense and combo layers are planned
 follow-ups on the same shared `lib/`.
 
-Current build: **Tinker.lua v0.1.262**.
+Current build: **Tinker.lua v0.1.264**.
 
 ## What it does
 
@@ -71,7 +71,7 @@ diagnostics toggles are available in the same menu.
 ## Help wanted: testing the new Defense phase
 
 The farm layer is calibrated on hundreds of demo and bot games. The new
-Defense phase (v0.1.260-262) is different: it only exercises against real
+Defense phase (v0.1.260-264) is different: it only exercises against real
 enemy pressure, which no demo game can produce. That is exactly where an
 earlier field report from a tester caught a freeze the demo runs had masked
 for weeks, so this is a genuine ask.
