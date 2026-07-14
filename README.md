@@ -6,7 +6,7 @@ reacts to enemy disables and threats with defensive item saves and escapes.
 It never auto-engages enemy heroes. Offense and combo layers are planned
 follow-ups on the same shared `lib/`.
 
-Current build: **Tinker.lua v0.1.264**.
+Current build: **Tinker.lua v0.1.265**.
 
 ## What it does
 
@@ -44,7 +44,7 @@ Typical bot-game result on an itemless build: 450-600+ GPM with zero deaths.
 - `lib/` - hero-agnostic libraries: map/camp data, lane wave scanning and
   prediction, route planning, scheduling, navigation, escape and risk math,
   plus KV-generated game data. Pure logic is engine-stubbed and unit-tested.
-- `tools/run_tests.lua` - the offline test suite (727 tests, no game needed).
+- `tools/run_tests.lua` - the offline test suite (728 tests, no game needed).
 - `tools/parse_debuglog.lua` - the log analyzer (farm/depth audits, per-wave
   coverage, time and gold accounting). Useful when reporting issues.
 
@@ -71,7 +71,7 @@ diagnostics toggles are available in the same menu.
 ## Help wanted: testing the new Defense phase
 
 The farm layer is calibrated on hundreds of demo and bot games. The new
-Defense phase (v0.1.260-264) is different: it only exercises against real
+Defense phase (v0.1.260-265) is different: it only exercises against real
 enemy pressure, which no demo game can produce. That is exactly where an
 earlier field report from a tester caught a freeze the demo runs had masked
 for weeks, so this is a genuine ask.
@@ -118,7 +118,7 @@ to get it fixed.
 Offline development loop:
 
 ```
-lua tools/run_tests.lua          # pure-Lua suite, expect 727 passing
+lua tools/run_tests.lua          # pure-Lua suite, expect 728 passing
 luac -p Tinker/Tinker.lua        # byte-compile check
 ```
 

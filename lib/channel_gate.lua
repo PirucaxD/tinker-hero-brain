@@ -33,7 +33,11 @@ function ChannelGate.Breakers(abilities, AD, TD)
     for _, ab in ipairs(abilities) do
         local mod = TD.ABILITY_TO_THREAT and TD.ABILITY_TO_THREAT[ab]
         local entry = mod and TD.THREATS_ON_SELF and TD.THREATS_ON_SELF[mod]
-        if entry and BREAKER_ROLES[entry.role] then
+        -- E3c (run-77: Lina LSA + tester-reported Zeus Bolt broke channels ungated):
+        -- the role taxonomy encodes SAVE semantics, not channel-break semantics -
+        -- delayed_aoe/magic_burst entries can carry full stuns or ministuns. Entries
+        -- tagged breaks_channel gate regardless of role.
+        if entry and (BREAKER_ROLES[entry.role] or entry.breaks_channel) then
             local r = tonumber(AD.CastRange and AD.CastRange(ab, 4)) or 0
             if r < 250 then r = 250 end   -- melee-range disables (Bash-class) still break on arrival
             out = out or {}

@@ -1359,6 +1359,16 @@ describe("lib/channel_gate -- Breakers + stamps (ARC E2)", function()
     it("Breakers returns nil for a kit with no breakers", function()
         assert_eq(CG.Breakers({ "generic_nuke" }, AD, TD), nil)
     end)
+    it("breaks_channel-tagged entries gate regardless of role (E3c)", function()
+        local AD2 = { CastRange = function(n) return ({ ministun_bolt = 700, plain_nuke = 800 })[n] end }
+        local TD2 = { ABILITY_TO_THREAT = { ministun_bolt = "m_bolt", plain_nuke = "m_nuke" },
+                      THREATS_ON_SELF = { m_bolt = { role = "magic_burst", breaks_channel = true },
+                                          m_nuke = { role = "magic_burst" } } }
+        local br = CG.Breakers({ "ministun_bolt", "plain_nuke" }, AD2, TD2)
+        assert_eq(#br, 1)                       -- only the tagged ministun gates; the plain nuke does not
+        assert_eq(br[1].ability, "ministun_bolt")
+        assert_eq(br[1].range, 700)
+    end)
     it("Stamp + ReadyAt: stamped ability reads not-ready until expiry", function()
         local st = {}
         CG.Stamp(st, "npc_dota_hero_lion", "lion_impale", 100, 12)

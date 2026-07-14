@@ -746,9 +746,20 @@ ThreatData.THREATS_ON_SELF = {
     modifier_lich_sinister_gaze                     = { role = "channel_on_me",    save = "bkb_or_grenade" },
     modifier_primal_beast_pulverize                 = { role = "channel_on_me",    save = "bkb_or_grenade" },
     modifier_grimstroke_soul_chain                  = { role = "channel_on_me",    save = "bkb_or_eul" },
+    -- E3c (Tinker run-77, user-sighted: Lina broke Rearm with LSA repeatedly): the
+    -- catalog was built from Lina's OWN perspective, so her kit never got
+    -- THREATS_ON_SELF entries - a blind spot for every OTHER hero brain. Profile +
+    -- ABILITY_TO_THREAT existed; this completes the triple. Landed stun arrives as
+    -- generic modifier_stunned (harvested), so this entry serves the CHANNEL GATE
+    -- (kit-awareness) + pre-impact recognition, not the reactive path.
+    modifier_lina_light_strike_array                = { role = "delayed_aoe",      save = "displacement", breaks_channel = true },
+    -- E3c (run-77 harvest x4): Fissure's LANDED victim-side stun is a separate mod
+    -- with its OWN profile (severity=lethal at :327) - an alias would shadow that
+    -- profile, so it gets its own entry (the recognition + landed-disable flee).
+    modifier_earthshaker_fissure_stun               = { role = "hard_disable",     save = "displacement" },
     modifier_puck_dream_coil                        = { role = "delayed_aoe",      save = "displacement" },
     modifier_leshrac_split_earth                    = { role = "delayed_aoe",      save = "displacement" },
-    modifier_jakiro_ice_path                        = { role = "delayed_aoe",      save = "displacement" },
+    modifier_jakiro_ice_path                        = { role = "delayed_aoe",      save = "displacement", breaks_channel = true },  -- E3c: 1.25-2s stun (Liquipedia) - breaks Rearm/Keen channels (Tinker run-77)
     modifier_mars_arena_of_blood                    = { role = "delayed_aoe",      save = "blink_or_bkb" },
     modifier_sand_king_epicenter                     = { role = "delayed_aoe",      save = "displacement" },
     modifier_templar_assassin_psionic_trap          = { role = "trapped",          save = "displacement" },
@@ -868,7 +879,7 @@ ThreatData.THREATS_ON_SELF = {
     -- v6.7 extrapolation (2026-05-11). Modifier names marked vpk need
     -- in-game confirmation via :FindAllModifiers() print before relying on.
     modifier_shadow_shaman_voodoo        = { role = "hard_disable",  save = "lotus_or_eul" },           -- vpk - Hex
-    modifier_zuus_lightning_bolt         = { role = "magic_burst",   save = "bkb_or_lotus" },          -- (verify)
+    modifier_zuus_lightning_bolt         = { role = "magic_burst",   save = "bkb_or_lotus", breaks_channel = true },  -- (verify) E3c: 0.35s ministun interrupts channels (Liquipedia; tester-reported vs Tinker)
     modifier_zuus_thundergods_wrath      = { role = "magic_burst",   save = "bkb_or_pipe" },           -- (verify) - global ult, 2s cast point
     modifier_tidehunter_ravage           = { role = "delayed_aoe",   save = "bkb_or_blink" },          -- vpk
     modifier_earthshaker_echo_slam       = { role = "delayed_aoe",   save = "bkb_or_blink" },          -- (verify)
@@ -3882,6 +3893,12 @@ ThreatData.CANONICAL_MOD_ALIASES = {
     -- projectile-phase and landed-phase locks correctly (a save fired on the
     -- line intercept suppresses a double dispatch when the stun lands).
     modifier_sandking_impale                   = "modifier_sandking_burrowstrike",  -- harvest + KV-absence
+
+    -- Jakiro Ice Path. Canonical = modifier_jakiro_ice_path (THREATS_ON_SELF,
+    -- ABILITY_TO_THREAT value; the zone/delay mod). The LANDED victim-side stun
+    -- is _stun (harvested 2026-07-14, Tinker run-77 x10; no dedicated profile,
+    -- so the fold inherits the canonical's - same threat, two phases).
+    modifier_jakiro_ice_path_stun              = "modifier_jakiro_ice_path",       -- harvest
 
     -- v0.5.140 Kez Grappling Claw. Canonical = _slow (the victim-side debuff that
     -- carries the harm profile + categorized close_gap + works reactively). The
