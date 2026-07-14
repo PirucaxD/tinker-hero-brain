@@ -204,6 +204,16 @@ function Schedule.Plan(ctx)
         end
     end
 
+    -- Defense case-file #2 (run-72 t=445): a DUE shove at low HP dispatched legally (no enemy
+    -- visible at decide), then HP panic fired on arrival = the keen + a ~50s fountain round
+    -- trip donated. Mana always had recover gates; HP had only the filler's need_recharge,
+    -- which a due shove (slack <= 0) bypasses entirely. Self-state is a dispatch
+    -- precondition: below the bar, recover first - the wave re-competes after the refill.
+    -- nil ctx fields = rule inactive (back-compatible).
+    if action == "shove" and ctx.hp_frac and ctx.min_hp_frac and ctx.hp_frac < ctx.min_hp_frac then
+        action, reason = "recover", "low_hp"
+    end
+
     -- defend: the enemy wave is crashing OUR tower - clear it (our safe side, defend + free farm).
     -- Runs LAST over any veto, code-faithful to the cascade order - EXCEPT unsafe (v2 deliberate
     -- fix: the old cascade could force a shove into a detected gank; safety keeps the last word)
@@ -237,6 +247,10 @@ function Schedule.StackWindow(now, opts)
     local base = math.floor(now / 60) * 60
     local aggro_at = base + aggro
     if now > aggro_at + slack then aggro_at = aggro_at + 60 end
+    -- neutrals first spawn at 1:00 (opts.first_spawn): a minute-0 window (aggro 0:54) targets a
+    -- camp that does not exist yet - run-66 walked 40s to stack_abort empty on it. Roll forward.
+    local first = opts.first_spawn or 60
+    if aggro_at < first then aggro_at = aggro_at + 60 end
     local done = (math.floor(aggro_at / 60) + 1) * 60 + 0.5
     return { aggro_at = aggro_at, from = aggro_at - 0.5, done = done,
              clear_t = done - aggro_at + 0.5, to = done + slack + 0.5 }

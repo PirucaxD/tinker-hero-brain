@@ -1297,6 +1297,81 @@ describe("lib/lane -- ClampBeyondSight (fog absence-of-vision floor)", function(
     end)
 end)
 
+describe("lib/schedule -- Plan low_hp dispatch gate (case-file #2)", function()
+    local CAL = { march_dmg_per_cast = 300, cast_dur = 0.5, robot_kill = 1.5, rearm_channel = 1.25, lead = 1 }
+    local function base(over)
+        local c = { now = 100, wave = { arrival = 100, eff_hp = 450, present = true },
+                    cal = CAL, travel_to_mid = 3, mana = 500, shove_cost = 200, safe = true }
+        for k, v in pairs(over or {}) do c[k] = v end
+        return c
+    end
+    it("a due shove below the hp bar recovers first (run-72 t=445: panic on arrival)", function()
+        local d = Schedule.Plan(base({ hp_frac = 0.35, min_hp_frac = 0.50 }))
+        assert_eq(d.action, "recover"); assert_eq(d.reason, "low_hp")
+    end)
+    it("healthy hp dispatches unchanged; nil ctx fields = rule inactive (back-compat)", function()
+        local d = Schedule.Plan(base({ hp_frac = 0.80, min_hp_frac = 0.50 }))
+        assert_eq(d.action, "shove")
+        local d2 = Schedule.Plan(base({}))
+        assert_eq(d2.action, "shove")
+    end)
+end)
+
+describe("lib/channel_gate -- DisableRange (ARC E1)", function()
+    local CG = require("lib.channel_gate")
+    local AD = { CastRange = function(n) return ({ lion_impale = 750, lion_voodoo = 525, generic_nuke = 800 })[n] end }
+    local TD = { ABILITY_TO_THREAT = { lion_impale = "m_impale", lion_voodoo = "m_hex",
+                                       pudge_dismember = "m_dis", generic_nuke = "m_nuke" },
+                 THREATS_ON_SELF = { m_impale = { role = "hard_disable" }, m_hex = { role = "hard_disable" },
+                                     m_dis = { role = "channel_on_me" }, m_nuke = { role = "magic_burst" } } }
+    it("max cast range over the disable kit", function()
+        assert_eq(CG.DisableRange({ "lion_impale", "lion_voodoo", "generic_nuke" }, AD, TD), 750)
+    end)
+    it("channel_on_me counts; unknown/short range floors at 250 (melee disables break on arrival)", function()
+        assert_eq(CG.DisableRange({ "pudge_dismember" }, AD, TD), 250)
+    end)
+    it("no disable kit -> nil (never gates)", function()
+        assert_eq(CG.DisableRange({ "generic_nuke" }, AD, TD), nil)
+    end)
+    it("nil-safe on missing inputs", function()
+        assert_eq(CG.DisableRange(nil, AD, TD), nil)
+        assert_eq(CG.DisableRange({ "lion_impale" }, nil, TD), nil)
+    end)
+end)
+
+describe("lib/channel_gate -- Breakers + stamps (ARC E2)", function()
+    local CG = require("lib.channel_gate")
+    local AD = { CastRange = function(n) return ({ lion_impale = 750, lion_voodoo = 525, generic_nuke = 800 })[n] end }
+    local TD = { ABILITY_TO_THREAT = { lion_impale = "m_impale", lion_voodoo = "m_hex",
+                                       pudge_dismember = "m_dis", generic_nuke = "m_nuke" },
+                 THREATS_ON_SELF = { m_impale = { role = "hard_disable" }, m_hex = { role = "hard_disable" },
+                                     m_dis = { role = "channel_on_me" }, m_nuke = { role = "magic_burst" } } }
+    it("Breakers lists each channel-breaking ability with its range", function()
+        local br = CG.Breakers({ "lion_impale", "lion_voodoo", "generic_nuke" }, AD, TD)
+        assert_eq(#br, 2)                        -- impale + voodoo break; the nuke does not
+        local seen, mods = {}, {}
+        for _, b in ipairs(br) do seen[b.ability] = b.range; mods[b.ability] = b.mod end
+        assert_eq(seen["lion_impale"], 750)
+        assert_eq(seen["lion_voodoo"], 525)                                 -- non-max entry keeps its own range
+        assert_eq(mods["lion_impale"], "m_impale")                          -- modifier name carried through
+        assert_eq(math.max(seen["lion_impale"], seen["lion_voodoo"]), 750)  -- matches DisableRange
+    end)
+    it("Breakers returns nil for a kit with no breakers", function()
+        assert_eq(CG.Breakers({ "generic_nuke" }, AD, TD), nil)
+    end)
+    it("Stamp + ReadyAt: stamped ability reads not-ready until expiry", function()
+        local st = {}
+        CG.Stamp(st, "npc_dota_hero_lion", "lion_impale", 100, 12)
+        assert_eq(st["npc_dota_hero_lion"]["lion_impale"], 112)                    -- table shape + t+cd arithmetic
+        assert_true(not CG.ReadyAt(st, "npc_dota_hero_lion", "lion_impale", 105))  -- 5s in, cd 12
+        assert_true(not CG.ReadyAt(st, "npc_dota_hero_lion", "lion_impale", 111.9))
+        assert_true(CG.ReadyAt(st, "npc_dota_hero_lion", "lion_impale", 112))      -- >= boundary reads ready
+        assert_true(CG.ReadyAt(st, "npc_dota_hero_lion", "lion_impale", 112.5))    -- past expiry
+        assert_true(CG.ReadyAt(st, "npc_dota_hero_lion", "lion_voodoo", 105))      -- unstamped = assume ready
+        assert_true(CG.ReadyAt(st, "npc_dota_hero_pudge", "lion_impale", 105))     -- other caster = assume ready
+    end)
+end)
+
 describe("lib/schedule -- StackWindow (v0.1.224)", function()
     it("mid-minute before the window targets THIS minute", function()
         local w = Schedule.StackWindow(120 + 30, { aggro_sec = 54 })
@@ -1313,6 +1388,13 @@ describe("lib/schedule -- StackWindow (v0.1.224)", function()
         local w = Schedule.StackWindow(60, { aggro_sec = 54, miss_slack = 1.5 })
         assert_true(w.aggro_at + w.clear_t <= w.to, "on-time start finishes inside the window")
         assert_true((w.aggro_at + 3) + w.clear_t > w.to, "a 3s-late start overruns")
+    end)
+    it("minute-0 window rolls past the first neutral spawn (run-66: 40s walk to an unspawned camp)", function()
+        local w = Schedule.StackWindow(30, { aggro_sec = 54 })
+        assert_eq(w.aggro_at, 114)                          -- 0:54 targets nothing (spawn at 1:00) -> 1:54
+        assert_eq(w.done, 120.5)
+        local w2 = Schedule.StackWindow(70, { aggro_sec = 54 })
+        assert_eq(w2.aggro_at, 114)                         -- minute 1 unaffected
     end)
 end)
 

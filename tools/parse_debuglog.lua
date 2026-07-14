@@ -962,9 +962,11 @@ elseif mode == "depth_audit" then
     --   W casts (cast point <= ~300 ahead of the hero): depth > 910 (550 + 300 + 60)
     -- klvl >= 2 events are reported separately (raid-era; legal by the keen rule).
     local WALK_MAX, F_GOOD, F_BAD = 550, { x = -7456, y = -6938 }, { x = 7408, y = 6848 }
+    -- v0.1.258: LAST self_acquired wins - debug.log can hold several script loads (run-73:
+    -- a team-2 setup session before the team-3 real game); the first one mis-teamed the audit.
     local team = 2
     for _, e in ipairs(events) do
-        if e.event == "self_acquired" then team = tonumber(e.kv.team) or team; break end
+        if e.event == "self_acquired" then team = tonumber(e.kv.team) or team end
     end
     local fp = (team == 2) and F_GOOD or F_BAD
     local ep = (team == 2) and F_BAD or F_GOOD
