@@ -39,6 +39,7 @@ local ChannelGate = require("lib.channel_gate") -- ARC E1: the pure kit-aware ch
 local Defense   = require("lib.defense")      -- ARC E2: the save dispatcher (Lina-proven, byte-identical)
 local ItemSaves = require("lib.item_saves")   -- ARC E2: hero-agnostic defensive item save bodies (requires lib.target itself; no item_data dependency)
 local Target    = require("lib.target")       -- ARC E2: enemy-hero test for the harvest filter (also loaded transitively by item_saves/escape)
+local Draw      = require("lib.draw")         -- v0.1.324 headroom lift wave 1: screen-space drawing/debug rendering (Font/W2S/Text/WorldText/Ring/Line/Seg/OBox)
 -- (lib.dedup require DROPPED at Task 3 review: the dispatcher's in_flight_locks
 -- subsume the responded-dedup role per lib/defense.lua:22-26.)
 
@@ -81,7 +82,6 @@ local function logline(s) tlog(1, s) end
 
 -- ── tuning (all calibratable; March extents confirmed only in-game) ──────────
 local K = {
-    HERO            = "npc_dota_hero_tinker",
     MARCH_LEN       = 1800, MARCH_HALFWIDTH = 900, MARCH_CAST_RANGE = 300,   -- coverage = rectangle CENTRED on the cast point: +/- MARCH_LEN/2 along facing, +/- HALFWIDTH perpendicular (Liquipedia: target = area centre; robots spawn at the back edge behind Tinker). CALIBRATED in-client 2026-06-24: the real sweep is a ~SQUARE box (HALFWIDTH 900, was a too-thin 450); MARCH_LEN kept canonical 1800 (the real footprint reads slightly longer but that's likely item/level/just visual).
     ARRIVE_DIST     = 120,   -- must be THIS close to the computed stand before casting W (so the cast point at the camp centre is within cast range)
     MARCHES         = { [0] = 2, [1] = 2, [2] = 2, [3] = 4 },  -- per camp tier 0=small 1=medium 2=large 3=ancient (0-indexed). v0.1.183 user-calibrated PLANNING floors (per-creep damage model): small/medium/large 2 (big camps clear in 2, at most 3 - the live execution budget tops up the occasional 3rd from the on-arrival ehp; Bottle/regen cover its mana), ancient 4 (user: 3-4, Dragon ~5 self-corrects live).
@@ -111,6 +111,7 @@ local K = {
     REFILL_FRAC     = 0.70,                         -- leave base + Keen back to the farm at THIS fraction of max HP AND mana (was ~full); do not idle at base to 100%.
     PANIC_HP        = 0.40, PANIC_ARM = 0.25,
     CONTEST_RADIUS  = 700,
+    CONTEST_LANE_R  = 1200,                        -- v0.1.312 (user): a side lane is YIELDED only when a CORE ally is within this of THAT wave's crash point (he is farming it now); absent = the wave is free. Replaces the coarse x-y diagonal band that marked a lane contested for any core anywhere in the map half. Calibrate: too small = we crash into the carry; too large = we skip free waves he left.
     CONTEST_CORE_BASE = 0.55,                      -- a lane wave is YIELDED to a CORE ally: role 1-3 (if a role API exists) OR role-tag base value >= this (carry/nuker/pusher/initiator/durable/disabler/escape >= 0.55; jungler/support/default below). Tunable.
     RISK_RADIUS     = 1400, RISK_HARD = 0.34,   -- camp-selection veto: a camp with risk >= this is NOT picked. Lowered 0.45->0.34 (v0.1.90) so DIRE-side / contested camps (a Radiant Tinker was farming dire camps at risk 0.36-0.44 under the old 0.45) are vetoed; own jungle + own ancient (~0.29-0.32) + up to the river still farm. Tight boundary (own ancient ~0.32 vs dire camp ~0.36); calibrate.
     GANK_RADIUS     = 1000,                      -- v0.1.95: lane_unsafe counts a GANK (>=2 enemies) only within this of the point - 2 DISTANT enemies (the v0.1.94 log recovered at risk 0.06 with enH=2 ~1057u away) are not a gank. Tighter than RISK_RADIUS. ponytail ceiling.
@@ -118,11 +119,11 @@ local K = {
     TOWER_ALIVE_R     = 300,                       -- v0.1.105 lane-prioritization: an enemy tower this near a static T1 spot = that T1 is alive (towers don't move; T1<->T2 mid are ~2200u apart so no cross-match). ponytail ceiling.
     TOWER_DYING_MARGIN_S = 3,                      -- v0.1.246 (TINKER_TOWER_DEATH_DESIGN.md): a crash tower predicted dead before our arrival + this margin excludes the wave this decide (cwhy/verdict tower_dying) - the wave lingers briefly after the fall, so arrival within eta+margin is still farmable.
     HELD_CLOSING_MIN     = 80,                     -- v0.1.256 (arc B re-applied): an enemy wave whose MEASURED speed reads at/below this is HELD/frozen (asrc=held trace tag; the honest eta already does the excluding). Run-64/71: real laners froze mid <100 u/s for long stretches.
-    TOWER_RISK_RADIUS = 900, TOWER_RISK_WEIGHT = 0.7, TOWER_ATTACK_RANGE = 700,   -- Deep 1 (v0.1.76 PLATEAU): the live-abort positional veto. A live enemy tower within ATTACK_RANGE = full WEIGHT (decisively unsafe), tapering linearly to 0 at RADIUS. WEIGHT 0.7 > SHOVE_SAFE_RISK 0.35 so lane_unsafe trips within ~800; catches the v0.1.73 death stand (791u -> 0.38).
-    TOWER_SAFE_MARGIN = 200,                       -- note 1 / option A (v0.1.159): a STAND must sit at least ATTACK_RANGE + this from every alive enemy tower (900 = the taper edge, risk 0). The old risk<0.35 gate stopped clamping at ~800 = "barely outside" the tower. March reach (1200) still covers 300 past the tower from 900, so the tower-border W-farm is intact. Stricter than the live abort = the SAFE direction of the v0.1.148 consistency rule.
+    TOWER_RISK_RADIUS = 1050, TOWER_RISK_WEIGHT = 0.7, TOWER_ATTACK_RANGE = 900,   -- v0.1.310 (user OBSERVED the tower attacking Tinker: "Tower Range is 900 not 850"): the real attack range is 900, not the 700 the v0.1.148/.76 calibration assumed. ATTACK_RANGE = full WEIGHT inside the real range, tapering to 0 by RADIUS 1050. WEIGHT 0.7 > SHOVE_SAFE_RISK 0.35 so lane_unsafe + the W2 step-in gate now trip within ~975 (was ~800 = INSIDE real range = the observed tower attacks).
+    TOWER_SAFE_MARGIN = 100,                       -- note 1 / option A (v0.1.159): a STAND must sit at least ATTACK_RANGE + this from every alive enemy tower = 1000 (v0.1.310: 100 past the real 900 range). March reach (1200) still covers 200 past the tower from 1000, so the tower-border W-farm is intact. The stand clamp (tower_safe binary) and the taper gates now agree: everything outside real range.
     FRONTIER_CACHE_S  = 0.5,                       -- structure-list cache for frontier_excess (enumerating every call inside the 40-step clamp loop is waste)
     FOG_MS = 550, FOG_SPREAD = 900, FOG_AGE_CAP = 5,        -- COR-1: fogged-enemy disc growth (Liquipedia move cap) / confidence decay length / drop fog staler than this (s). Tune off the `sched ... risk=` log.
-    FARM_SAFE_RISK  = 0.42,                                 -- Part A (N3): abort a COMMITTED camp trip (move/engage) when LIVE fog-aware risk at the stand hits this; mark cleared + recover so the planner picks elsewhere (no churn). Below RISK_HARD 0.45 so it bails before the camp would re-veto.
+    FARM_SAFE_RISK  = 0.42,                                 -- Part A (N3): abort a COMMITTED camp trip (move/engage) when LIVE fog-aware risk at the stand hits this; mark cleared + recover so the planner picks elsewhere (no churn). Note: FARM_SAFE_RISK 0.42 sits ABOVE RISK_HARD 0.34 (v0.1.90 lowered RISK_HARD) - a committed camp aborts at 0.42 while selection vetoes at 0.34 = a deliberate hysteresis band (no select/abort flip-flop).
     STAND_RING      = 250, STAND_STEP = 30,    -- stand THIS far from the camp CENTRE (< March cast range 300) so W lands on the creep cluster + the hero has vision. The old box-corner ring (cluster_radius+margin) put the stand ~800 out (box half-diag ~737), past cast range, casting short into fog.
     PAIR_RADIUS     = 1800,                       -- pair an assumed-occupied partner within this. The centred March covers up to MARCH_LEN apart, so set ~= MARCH_LEN; 1500 wrongly excluded the river/lane pairs at d=1500-1800. Lower to skip far/edge-clipping pairs. (Specific over-range pairs are whitelisted via K.FORCE_PAIRS.)
     CREEP_DISC      = 200,                        -- creep disc radius for the pair clear-class (Farm.PairClearClass): clean if d/2+CREEP_DISC <= MARCH_LEN/2 (one March clears both), else clip. Feeds the lean-in clip budget + the calibration overlay; calibrate off the overlay.
@@ -141,14 +142,14 @@ local K = {
     WAVE_HOLD_NEXT  = 12.0,                       -- v0.1.153: when the hold deadline expires with no wave, KEEP holding if the measured rhythm puts the next wave within this many seconds (a window this small is never worth a camp trip; ~MIN_CAMP_SLACK at zero travel)
     WAIT_PROTECT_AHEAD = 350,                     -- note 3: wait this far from the structure TOWARD the stand (inside its cover, facing the lane)
     WAIT_BACKOFF       = 600,                     -- note 3: no structure in scan range -> wait this far back from the stand toward our fountain
-    WAIT_ENEMY_R       = 1400,                    -- note 3: an enemy hero within this of the stand moves the wait to the protected spot (GANK_RADIUS + harass reach)
-    STEP_OUT_LEAD      = 1.5,                     -- task #12 (anchor tether): leave the tether this many s BEFORE eta_live - walk_time (turn + hold-eps + cast setup). Calibrate off --cycle-report.
+    STEP_OUT_LEAD      = 1.5,                     -- task #12 (anchor tether): leave the tether this many s BEFORE eta_live - walk_time (turn + hold-eps + cast setup). LIVE branch only since v0.1.322 (the fogged step-out reserves the pre-cast window below). Calibrate off --cycle-report.
+    STEP_OUT_PRECAST_S = 6.0,                     -- v0.1.322 (user doctrine: clear ASAP = be in the right place EARLY, pre-cast W1 so the wave walks into it, W2 in sequence): the FOGGED step-out arrives this many s before eta_live - the PRE-CAST window = W_LEAD_FOG_S 3.5 + cast setup ~1.5 + landing margin ~1.0. eta-1.5 (the old engage lead) sat INSIDE the W1 lead = in place too late to pre-cast. GPM-law "pre-position ~8s early" (step-out ~eta-10 with keen transit, land ~eta-6). Calibrate off the fog-timing sub-line (land ~eta-6) + shove_pre tarr~3.5.
     DEPTH_POINT_BUDGET = 600,                     -- Risk v2 axis 1 (task #11, user point system): a shove stand whose Farm.DepthPoints exceed this reads covers=false -> no_safe_stand -> jungle. DECIDE-only (never a movement veto). Run-13 anchors: dead-T1 meeting ~1100 past x1.5 side-T1s = 1650 (excluded at L1); with the keen shave 150 (allowed at L2). Calibrate off ft.dpts.
     DEPTH_KEEN_SHAVE   = 1500,                    -- axis 1: flat point shave when Keen L2 is READY (the escape capability; "having keen can shave off points"). Sized so typical post-T1 meetings (~1000-1400 past, 1.5x) pass at L2 while T2-deep territory (2500+ past) still busts even with keen.
     WAVE_CAMP_ALT_S    = 30,                      -- Risk v2 axis 2: a shove whose ROUND-TRIP travel exceeds this jungles instead (reason=far_wave) - the walk out-costs ~2 camp clears. The fed travel is raid-aware (L2 creep-keen collapses it), so deep waves re-qualify at Keen L2 automatically. Run-13: deep walks RT ~40 (skip at L1), river meetings RT ~25 (keep).
     SIDE_STAMP_MAX_S   = 60,                      -- PHASE 2 (TINKER_SIDE_ANTICIPATION_DESIGN.md): a side lane's cadence stamp is FRESH for this long (2 wave periods) - fresh = fogged side anticipation dispatches like mid (asrc=stamp); staler = verdict stale, not a candidate. Calibrate off ssrc=stamp arrival eta_err.
     GONE_BAL_MIN       = 2,                       -- gone-by-arrival (run-21): our wave wins by >= this (push-sim bal) AND the fight ends before we can arrive -> nothing to farm, jungle. bal=1 marginal keeps the shove. Calibrate off reason=gone_by_arrival vs arrivals that DID have creeps.
-    WALK_DEPTH_MAX     = 550,                     -- THE STAIRS LINE (v0.1.192 user; v0.1.193 = EXCLUSION not clamp): a wave whose NATURAL stand (CrashCast standback, unclamped) sits deeper than this is not walk-farmable -> covers=false -> Plan jungles it (no_safe_stand / gone_by_arrival). Never clamps movement or parks stands at the line (the run-23 22-25s waits). stand_depth 0 = the fountain-axis midpoint = the mid river. KEEN-TO-CREEP (raid/deep_ok) is EXEMPT pre-T1-drop; after the enemy mid T1 falls the T1DOWN_LEASH binds everything (v0.1.201). Calibrate vs the actual ramp on the overlay.
+    WALK_DEPTH_MAX     = 1100,                    -- v0.1.327 RE-ZEROED with the S2 per-lane depth (was 550 in the fountain-mid frame): depth 0 is now the LANE's T1 midpoint (the meet ground), and 1100 preserves the .324 RADIANT REFERENCE behavior exactly - the old Radiant frame effectively allowed centre+1133 (550 + the 583 zero offset), and that is the posture the user validated; Dire now gets the SAME band for the first time (its old effective edge was centre-33 = could not reach its own meet). Semantics unchanged otherwise (v0.1.193 EXCLUSION not clamp: deeper natural stand -> covers=false -> Plan jungles it; never clamps movement). KEEN-TO-CREEP (raid/deep_ok) EXEMPT pre-T1-drop; T1DOWN_LEASH binds after (v0.1.201). The depth-audit uses the SAME lib ruler + this value.
     T1DOWN_LEASH       = 3000,                    -- v0.1.201 (user, run-29): after the enemy mid T1 DROPS, max lane-position distance from our foremost alive mid tower. Exclusion (covers -> jungle), never a movement clamp; forward-only (positions behind the tower never bind). UNGANKABLE creep-keen raids exempt (v0.1.202). v0.1.204 (user MAP-MEASURED): our T1 -> river center ~2000-2200; the expected post-T1 equilibrium ~3000 = the END OF THE STEPS (matches code geometry: T1 depth -2041 + 3000 reaches ~depth +950; the stairs line 550 still governs walking stands, so the leash trims off-axis/deep cases). Calibrate per the leash standing rule (careful analysis first).
     ENGAGE_EMPTY_GRACE = 1.2,                      -- tolerate this many seconds of occupancy=false at the camp (creeps chasing out of the box) before bailing
     MIN_CASTS_BEFORE_EMPTY = 2,                     -- A: require at least this many fired Marches before honouring an "empty" read (a 1-cast occupancy flicker as creeps aggro out was bailing with got=6)
@@ -169,23 +170,40 @@ local K = {
     ROUTE_RISK_WEIGHT = 70,                        -- gold penalty per unit risk in the planner score. Raised 40->70 so low-value ENEMY-side camps lose to safe own-jungle/lane (Note 2: Tinker was dipping into enemy jungle for a value-101 camp).
     HOME_LANE       = "mid",                        -- Tinker's lane: never yielded to allies (Note 3), so he returns to farm his own waves.
     WAVE_STANDBACK  = 900,                          -- Tinker Marches a wave from RANGE: the wave STAND (+ its risk) sits THIS far back toward our fountain from the creep cluster (Note 2: ~900u from the wave so it stays safe + March's forward sweep still covers it). Calibrate.
-    ANTICIP_RANGED_REACH = 800,                     -- LANE ANTICIPATION: when the lane is clear, the forward stand sits THIS far back from the trailing RANGED creep so the March footprint lands on it as the wave arrives. 850 -> 800 (2026-07-02, user: stand 50u closer to the ranged). Contested -> falls back to WAVE_STANDBACK. Calibrate in-client.
+    ANTICIP_RANGED_REACH = 810,                     -- W-GEOM-1 THE STANDARD CAST POSITION (user design, TINKER_W_GEOMETRY_STUDY.md sec 3): 900 box-half x 0.9 = the max distance the robots CERTAINLY hit the trailing ranged (-10% safety). Both the anticipation AND the live contested stand anchor the RANGED at this (the old contested fallback stood 900 from the ranged = the 100% coverage edge = the missed-by-a-little class). A disabler behind their wave must now walk the robot corridor to reach a channel.
+    STAND_KITE_EPS       = 100,                     -- W-GEOM-1: the ENGAGE maintains the standard position - when the advancing wave closes the gap below ANTICIP_RANGED_REACH - this, step back to the (receding) live stand between casts. The position SHIFTS with the wave (user: "this position should shift").
     WAVE_LEAD       = 150,                           -- Note 5: lead the WAVE aim this far toward the TRAILING ranged creep (the side away from our fountain) so the March footprint spans it. Waves only (camps unaffected). Calibrate in-client.
-    W_FRONT_MAX     = 800,                          -- v0.1.221: hold the FRONT W until the wave is within this (arrivals trigger at 950; casting at the clamp put the wave at the sweep's far edge = partial/zero kills). Calibrate.
-    W_EDGE_DELAY_S  = 2.5,                          -- v0.1.221: max hold for the edge-close (a stalling/retreating wave still gets served). Calibrate.
+    W_LEAD_S        = 4.75,                         -- v0.1.277 W-GEOM-3 (lib/march_sim lead sweep, study sec 9): fire the FIRST W when the closing wave is this many seconds from the stand - the robot stream and the wave meet AT the stand. Sweep: each lead second saves ~1s of engage below 4s, saturates 4.5-5.5, reverses past ~6. Replaces the v0.1.221 W_FRONT_MAX edge hold (the instant-AOE compensation). Calibrate DOWN first if casts whiff.
+    W_LEAD_CAP      = 1900,                         -- v0.1.277: never lead-cast a wave farther than this (325 speed x ~5.5s + margin; a faster-closing wave is capped by geometry, not time).
+    W_CLOSING_MIN   = 80,                           -- v0.1.277: the commit-local closing EMA must read at least this (u/s) for the lead cast - held/receding waves never preempt (they get the normal arrival cast). Mirrors arc-B HELD_CLOSING_MIN.
+    W_LEAD_FOG_S    = 3.5,                          -- v0.1.279 (run-87 "too early"): the FOG preempt's own lead - cadence-stamp arrivals read +1..+5s LATE vs eta, so the fog cast's effective lead = this + the drift, landing in the sweep's 4.5-5.5 saturation band. Calibrate against fog=y -> eta_err.
+    MISS_FREE       = 1,                            -- E3a (v0.1.313) threshold for hiding enemies (Escape.MissingCount, visible==false). v0.1.316: the raidcap veto using this was REMOVED (confirmation run - the global veto killed deep/near-tower keen-raids whenever 2+ enemies were merely off-screen); RETAINED for the proximity-aware refit that will re-gate only when a hiding enemy can reach the landing. Currently unused by raidcap.
+    FOG_FRESH_S     = 1.5,                          -- v0.1.317 fog-threat: a fogged enemy older than this is too stale to count as a specific gank (reachable_fog freshness gate). Calibrate.
+    FOG_REACH_CAP   = 450,                          -- v0.1.317: cap the fog probable-disc reach for the gank count (was the untouched GANK_FOG_REACH 600). Tighter = fewer phantom-gank aborts. Calibrate DOWN if the jungle-drift persists, UP if deaths appear.
+    W_PRE_MIN_N     = 3,                            -- v0.1.280 (run-88: a W preempted onto a creeps=1 straggler): minimum LIVE creeps for a lead cast; thinner remnants take the normal arrival flow (its budget prices them honestly).
+    W_CAST_REACH    = 700,                          -- v0.1.305 re-applied .291 (run-99 user: casts vs a FIGHTING wave still missed the ranged, "give it more room, about 10 to 15%"): 800 -> 700. The .286-era 800 also sat INSIDE the 810 stand = a held-wave dead band; the step-in closes the gap. FIRST cast only (W2+ ungated, the consecutive principle).
+    W_WAIT_RELEASE_S = 4.0,                         -- v0.1.305 re-applied .288: max casts=0 in-engage wait for the wave to close into cast reach; longer = held/receding -> release to the jungle window (suppress SHOVE_STUCK_S, re-competes next decide).
+    W_PRE_STAND_R   = 600,                          -- v0.1.282 (run-90 user: "moving forward to meet the wave... makes zero sense for a 900-coverage skill - just time it and cast"): the wave approach STOPS this far from the computed stand and the preempt/prearm/timed gates accept it - the box half (900) covers the gap and the wave walks in; standing short = farther from the meet = safer. The exact stand was positioning theater for a 1800 box.
     WAVE_MAX_W      = 2,                            -- DEFAULT for the "Marches: lane wave (max W)" menu slider: HARD CAP on W (March) casts per LANE-wave clear (the engage budget). shoveCasts from ClearTime(eff_hp) is capped to it so a big/over-estimated wave can't burn endless W under the tower. Applies to the wave being ENGAGED (visible or an arrived incoming one); waiting casts nothing. Camps have their own budget. Live-tunable on the HUD.
+    LANE_MEET_TTL      = 90,                      -- v0.1.303 LANE-CLOCK: an observed arrival ground (State.laneMeet) anchors fogged dispatches for this long (3 wave periods); older -> the lane midpoint fallback (s.meeting).
+    LANE_ANCHOR_BACK   = 600,                     -- v0.1.307 THE ANCHOR FLOOR (run-112 vs Lina): the fogged dispatch ground never sits deeper OUR-side than this past the river - pushed waves arrive at our tower and would teach the clock to wait there ("the end of the tower as the cast anchor"). Meet waves FORWARD; the pre-casts clear them before the tower; the live ranged owns precision once visible.
+    INTERCEPT_FWD_R    = 600,                     -- v0.1.323 BEST-POSITION CASTING (user doctrine 2026-07-20): advance the committed MID meeting this far UP-LANE before the band clamp, so the wave is met - and W1 lands - as far forward as the walk law allows instead of at the tower-band crash. clamp_intercept caps the ratchet (WALK_DEPTH_MAX / LANE_ANCHOR_BACK); safe_stand_for + tower_safe + risk gates own per-stand legality; the Lane-Clock re-anchors on the observed forward ground within ~1-2 waves. Calibrate: tighten FIRST if a death traces to forward exposure.
     WAVE_TRACK_RADIUS  = 1600,                      -- read enemy lane creeps within this of the wave's last-known point to TRACK the moving wave (recompute the live centroid each tick); generous so a pushing wave is not lost.
     WAVE_ENGAGE_RANGE  = 950,                       -- ENGAGE + keep Marching while within this of the LIVE centroid (~= WAVE_STANDBACK; March's ~300 cast + ~900 forward sweep still covers it). Calibrate (Note 2: stand ~900u from the wave).
     DEEP_THIN_EFFHP    = 1150,                       -- v0.1.195/196 (user, deep era = lane-phase timing): in the T1-DEAD era ONLY (the lane phase is perfect, untouched), a VISIBLE wave past the stairs line must be ~3+ creeps (full wave 1950, 2-creep remnant ~1100) to justify the raid trip; thinner -> jungle, the next FULL predicted wave gets the timed raid. Fogged ExpectedWave estimates are full waves and pass untouched.
     NC_GRACE_S         = 3.0,                        -- v0.1.195 (run-25): a live nocover wave gets this long to prove it is CLOSING before the commit bails - nocover fired on an INBOUND wave (their push crashing our tower) whose current position read deep, and the abort+suppress walked him to our T1 as the full wave arrived.
     NC_CLOSE_EPS       = 100,                        -- v0.1.195: dWave must drop this much to re-arm the nocover grace (a closing wave covers it in ~0.3s at 325; a held fight wobbles less).
-    W_BEHIND_STEPIN_MAX = 1000,                      -- v0.1.195 (user, run-25 "all W cast from front at center meetings"): a due-but-ineligible BEHIND cast steps IN toward the aim when the shortfall is near (aim <= this), instead of burning the turn on another front cast. At the 850 stand the rear sweep is geometrically impossible (spawn edge ~840 < aim 850+), so a wave HELD at the meeting starved the latch (run-25: 30F/5B).
+    NC_HOLD_NEAR       = 1600,                       -- v0.1.274 (CASE-FILE 3, run-83): a HELD nocover wave within this keeps the frozen stand (a near locked fight resolves fast and the 950 engage trigger sits just under it); farther bails to the jungle window as before. Calibrate.
+    WAVE_VIS_DEBOUNCE_S = 0.7,                       -- v0.1.275 (run-84 "frenetic back and forward"): the live/fogged wave-branch switch needs the contrary visibility to persist this long - a vision-edge flicker alternated the protected hold and the stand re-approach every tick. Costs at most this much engage delay on a real arrival mid-fog.
+    PROT_CLEAR_S        = 2.0,                       -- v0.1.276 (run-85: the flap survived .275 - the REAL flicker was the fogged wait's enemy-near predicate, the enemy disc aging in/out at the vision edge): the protected-hold latch releases only after the hold reads enemy-clear this long straight. ON is instant (safety).
+    W_X_ARM_A          = 45,                         -- v0.1.270-271 W-GEOM-2 (user design): THE CROSS - two cast lines 90 deg apart, the pair rotated 45 off the hero->aim axis. Arm A rotation (deg). v0.1.271 fixed the misread arm B: the user's "then turn 90 the other way" is RELATIVE to arm A (+45 - 90 = -45), not -90 absolute (run-82 showed the -90 arm casting perpendicular across the lane). Calibrate by pat= census if kills read off.
+    W_X_ARM_B          = -45,                        -- v0.1.271: arm B = the cross's other line. Sim note (study sec 8): the mutual-90 cross partially decorrelates the melee shadows - marginal on the static early wave at W lvl2 (ranged ~80 hp short in the model), clean at lvl 4; watch early-lane clears.
     TETHER_MAX_HOLD_S  = 10.0,                       -- v0.1.208 (run-33 "eternal waiting"): a tether whose step-out is farther out than this releases to the planner (shove suppressed for the wait) - a raid's keen transit (~4s) makes long closes pure idle at the hold spot; the window fits a camp. Calibrate.
+    LIVE_STALL_S       = 15.0,                       -- v0.1.330 THE STALLED-LIVE RELEASE (g328: 124+51+47s statues): a committed wave that is LIVE but beyond engage range and NOT closing (wgClose < W_CLOSING_MIN or unwarmed) for this many seconds straight releases the window (suppress this long, redecide) - the state [spent-or-waiting commit + far-stalled wave] had NO exit (arrival needs dref<=950; phantom-bail needs invisible; tether release is pre-step-out; MOVE_TIMEOUT is refreshed by the ENGAGE->MOVE reposition ping-pong, :4949-class). moveSince-INDEPENDENT by design. Calibrate off stall_release lines vs genuine slow closes.
     TETHER_WALK_MAX_S  = 6.0,                        -- v0.1.194 F2 (run-24): a raid-capable tether leg WALKS only when the hold is this close (v0.1.188's keen-preservation case); farther rides the keen ladder - the step-out re-arms (rearm-reset -> keen) for the raid hop anyway (v0.1.175), while the walk-always rule marched him 8-10k from the fountain.
     STUCK_TELEPORT_S   = 4.0,                        -- v0.1.121 (note 3, user): GLOBAL stuck-breaker - if the hero is moving toward a target (MOVE/RETURN), is FAR from it, and his position has not changed for this long, he is physically blocked -> TELEPORT (keen home) to unstick. Last-resort backstop over the per-state watchdogs.
     STUCK_FROZEN_DIST  = 60,                         -- v0.1.121: position moved LESS than this over the window = "not moving" (frozen).
     STUCK_FAR_DIST     = 400,                        -- v0.1.121: only count as stuck if this far from the move target (else he is legitimately standing AT the stand/target waiting - do not teleport).
-    REARM_SAFE_RISK    = 0.20,                      -- Rearm in the field only when enemy_risk_at(hero) < this (else exposed near enemies); at base risk ~0 so always allowed (Note 3: safe Rearm).
     BLINK_RANGE        = 1200,                      -- item_blink cast range (regular dagger; arcane=1400). ponytail: const, not lib/item_data (no extra deploy) since Tinker buys regular blink. Read item_data if he ever buys arcane/overwhelming.
     BLINK_CLAMP        = 960,                       -- max landing distance (blink_range_clamp); overshoot beyond this lands at the clamp
     BLINK_TRAVEL_MIN   = 400,                       -- v0.1.209 (user FINAL blink doctrine: "use blink whenever it is safe... no chances of getting jumped"): the dagger is NOT rationed by distance anymore - the fog-aware risk gates own the only veto (jump risk), Eureka refunds the cd. This floor is order-sanity only (a <400u blink is a twitch, not travel). Was 800 ("protect the escape") - that protection is the risk gate's job now.
@@ -203,6 +221,7 @@ local K = {
     CHANNEL_GATE_HORIZON = 3.0,                      -- E2 final review: readiness is judged at now()+this (covers the 2.93s Keen channel) - a breaker coming off cd DURING our channel still breaks it
     CHANNEL_DEFER_BAIL_S = 4.0,                      -- run-75: a wave engage whose Rearm the gate has deferred this long (parked disabler) bails + suppresses instead of standing (the .239 never-hold law)
     CRASH_STICKY_S       = 10.0,                     -- run-76: a crash-our-tower flag seen by the 2s scan counts as crashing for this long (the instantaneous flag flickers mid-fight; decides sampled false instants and the 415g bot T2 wave went undefended)
+    REARM_STEPBACK_S     = 4.0,                      -- run-78: a wave engage whose Rearm the gate blocks walks OUT of the gating enemy's reach for up to this long to rearm there (keeps the wave); expiry falls through to the .262 bail
     DISPATCH_HP_MIN     = 0.50,                      -- case-file #2 (run-72 t=445): a due shove below this HP fraction recovers first - PANIC_HP 0.40 fires on arrival otherwise (keen + ~50s donated); fed to Schedule.Plan as ctx.min_hp_frac
     LASER_MANA_FB       = 95,                         -- Laser mana fallback (Liquipedia ~95-120); abil_mana reads the real cost, this is only used if that read fails
     LASER_DMG           = { 75, 150, 225, 300 },      -- pure damage per Laser level (lib/ability_data, KV/Liquipedia-verified). PURE = ignores armor + magic resist, so a neutral is last-hittable iff its CURRENT hp <= this.
@@ -227,16 +246,12 @@ local K = {
     SHOVE_STUCK_S       = 6,                                 -- Note 1: after a shove crash stand proved unreachable (keen landed on tower high ground), suppress re-picking the shove for this long (recover instead) so Tinker does not loop re-keening the same unwalkable spot
     ENGAGE_COVER_DIST   = 450,                               -- AREA engage: within THIS of the cast aim, March's square already covers the camp -> engage (no exact-point requirement). MARCH_CAST_RANGE 300 + ~150 slack; cast clamps 280 ahead, the square reaches well past. Calibrate vs clear quality.
     MULTI_W_OFFSET      = 50,                                 -- W cast offset FROM TINKER in the (90-deg-rotated) target direction. Small: the ~1800 box covers the cluster from right next to Tinker, so casting close (in-range, robots sweep THROUGH the creeps) beats pushing the box 300 off-centre. Calibrate.
-    W_BEHIND_BACKSTEP   = 60,                                -- v0.1.173 (run-11 user report: both W's flew the SAME direction): the BEHIND cast targets THIS far behind the hero (opposite the wave), FLIPPING the facing so the robots spawn at the box's far edge (me + (MARCH_LEN/2 - backstep) toward the wave) and sweep BACK through it - the enemy REAR (the ranged) eats them first. The old aim+350 target clamped onto the SAME forward ray as the front cast (cast range ~280 << the shift) = two identical casts.
-    W_BEHIND_CLEAR      = 60,                                -- v0.1.176 (run-14 census: 20 front / 2 behind): rear-sweep eligibility margin - the spawn edge (me + 900 - backstep) must clear the AIM (trailing ranged) by this. Was CREEP_DISC(200) -> <=600, then 100 -> <=700; v0.1.184 (run-19 dig: 22F vs 4B lost in the dWave 500-699 band - the aim reads +200-400 deeper than the centroid) 60 + backstep 60 -> eligible at aim-dist <= 780 (worst-case edge clearance 60u = still past the ranged creep's center). Physics bounds the rest: 35/74 fronts fired at dWave >= 700 where no rear sweep can exist.
     MARCH_REACH         = 1150,                               -- a camp is March-coverable from here if within this (cast clamps 280 ahead + the square reaches ~900 more). Used by the river-fallback pair engage + the watchdog.
     -- THE BOX = a THIN RECTANGLE aligned to the camp-connecting (A->B) axis, centred on the midpoint.
     -- ALONG the axis is the CRITICAL direction (moving unbalances the two camp distances) so it is tight;
     -- PERPENDICULAR keeps both camps ~symmetric so the hero may shift more there. More precise than a disc.
     BOX_ALONG           = 50,                                 -- half-extent ALONG the camp axis (the WIDTH, the critical direction - moving along unbalances the two camp distances). v0.1.107 (user note 1): halved 100->50 (the "cut the width in half" that was asked; v0.1.101 wrongly cut the perpendicular/length instead).
     BOX_PERP            = 300,                                -- half-extent PERPENDICULAR to the camp axis (the LENGTH, roomy - both camps stay ~symmetric when shifting here). v0.1.107 (user note 1): restored 150->300 (v0.1.101 had halved this by mistake).
-    WAVE_STRUCT_SCALE   = 0.5,                                -- R2: waves are Marched from WAVE_STANDBACK(900), so positional danger is halved - scale the structural risk for wave stands so a near-tower wave is not vetoed (we farm it from range).
-    WAVE_STRUCT_CAP     = 0.35,                               -- R2: cap the structural part of wave risk below RISK_HARD(0.45) so position alone never vetoes a wave; live enemy proximity still can.
     -- Shove gates (TINKER_SCHEDULE_DESIGN.md):
     SHOVE_SAFE_RISK     = 0.35,                               -- skip a shove when the 900u-stand risk is >= this. Calibrate.
     -- (the depth-veto patch family - DEPTH_AT_LINE/DEPTH_PAST_LINE/DEPTH_DIVE_MARGIN/SHOVE_MAX_DEPTH/
@@ -270,7 +285,8 @@ local K = {
 
 ----------------------------------------------------------------- state ----
 State.fsm          = "DECIDE"
-State.laneWaveT    = {}    -- PHASE 2 (TINKER_SIDE_ANTICIPATION_DESIGN.md): per-lane cadence anchors {mid=,top=,bot=} - game-time a wave was last cleared at that lane's shove point. Mid consumers read .mid (the old lastWaveT, unchanged semantics); side entries feed side_wave_ctx stamp anticipation.
+State.laneWaveT    = {}    -- PHASE 2 (TINKER_SIDE_ANTICIPATION_DESIGN.md): per-lane cadence anchors {mid=,top=,bot=} - game-time a wave was last cleared at that lane's shove point. Mid consumers read .mid (the old lastWaveT, unchanged semantics); side entries feed side_wave_ctx stamp anticipation. v0.1.303 D-B: ALSO stamped at every wave_engage_arrived (arrivals were only stamped by 2 of ~6 exits - one imperfect wave regressed the clock to kinest).
+State.laneMeet     = {}    -- v0.1.303 LANE-CLOCK D-A (TINKER_LANE_SCHEDULING_STUDY.md): per-lane last OBSERVED arrival ground {x=,y=,t=}, stamped at wave_engage_arrived. THE fogged anchor: a fogged lane-phase wave dispatches to where waves actually arrive, never to the mirror-kinematic guess (err 300-1400u = 40 geometry-vetoes runs 104-107 + 3/5 baseline misses run-108).
 State.shoveLeaveBy = nil   -- leave-by deadline set by Schedule.Plan when a camp is picked (preemption)
 State.schedSlack   = nil   -- slack budget handed to the jungle planner
 State.marchCasts   = 0
@@ -451,14 +467,14 @@ local function cd_remaining(ab)
     if ok and type(cd) == "number" and cd > 0 then return cd end
     return ready(ab) and 0 or 0.1
 end
-local function verify_cast(name, ab)
-    State.pendingVerify = { name = name, ab = ab, baseCD = cd_remaining(ab), expire = now() + 0.6 }
+local function verify_cast(name, ab, extra)
+    State.pendingVerify = { name = name, ab = ab, baseCD = cd_remaining(ab), expire = now() + 0.6, extra = extra }
 end
 local function process_verify()
     local v = State.pendingVerify
     if not v then return end
     if (not ready(v.ab)) or cd_remaining(v.ab) > v.baseCD + 0.05 then
-        logline(v.name .. " FIRED"); State.pendingVerify = nil
+        logline(v.name .. " FIRED" .. (v.extra or "")); State.pendingVerify = nil
     elseif now() > v.expire then
         logline(v.name .. " issued_NOT_fired"); State.pendingVerify = nil
         -- E0 (B6): a swallowed keen/rearm ORDER must not leave a ~3s PHANTOM channel window -
@@ -531,19 +547,54 @@ local function enemy_fountain_pos()
     return nil
 end
 
--- v0.1.97: signed DEPTH of `pos` past mid along the lane axis (own fountain -> enemy fountain).
--- + = enemy side (units past mid center toward the enemy), - = own side. Vetoes a DEEP shove (keening
--- into enemy territory to chase a winning wave = under-tower stuck / a collapse / a backline keen). A
--- depth threshold catches the deep stand regardless of travel-to-mid (the v0.1.96 log's deep shove had
--- travel 11.6, just under SHOVE_FAR_TRAVEL 12, so the old travel-only gate missed it). 0 if a fountain
--- is unknown. Replaces the v0.1.95 binary stand_enemy_side (which over-triggered on a barely-past-mid stand).
-local function stand_depth(pos)
+-- v0.1.327 S2 PER-LANE DEPTH (user-approved tree review; the side-parity root fix): signed depth
+-- of `pos` in the LANE frame - zero at the LANE's T1 midpoint (mid (-510,-378) = the observed meet
+-- ground; top/bot theirs), + = enemy side, axis unchanged (own fountain -> enemy fountain). The old
+-- zero (the FOUNTAIN midpoint) sits ~583 lane-units toward DIRE of the mid centre, so Dire read the
+-- lane centre at +583 (past the old 550 band = could not dispatch to its OWN meet -> the under-tower
+-- posture, the whole 2026-07-20 arc) while Radiant's band reached centre+1133. Lane.DepthRuler /
+-- Lane.Depth are pure lib fns (offline-tested, 753/0) consumed by the brain AND the depth-audit -
+-- the auditor can never drift from the brain again. `lane` defaults to mid; relative comparisons
+-- (pos-vs-tower) cancel the zero under any lane. Ceiling: S4 arc-length depth, same contract.
+local function stand_depth(pos, lane)
+    if not pos then return 0 end
+    State.depthRuler = State.depthRuler or (State.team and Lane.DepthRuler(MapData.TOWERS, MapData.FOUNTAINS, State.team)) or nil
+    if not State.depthRuler then return 0 end
+    return Lane.Depth(State.depthRuler, pos, lane)
+end
+-- v0.1.315 THE TWO-SIDED INTERCEPT CLAMP: a FOGGED lane-phase crash is clamped to the
+-- walk-farmable lane band [ -LANE_ANCHOR_BACK (our side) .. WALK_DEPTH_MAX (enemy side) ]
+-- along the fountain axis. v0.1.307's anchor floor clamped ONLY the too-deep-our-side case
+-- (tower-pushed arrivals teaching the clock to wait at our tower); the too-deep-ENEMY case
+-- (s.meeting skewing deep when laneMeet is empty/stale, run-115) dispatched a deep stand
+-- that estimates-never-veto passed [covers=true] but the movement walk-law then deep_rejected
+-- = the shove_stuck flutter + jungle-preference + stuck-at-our-tower regressions. Meet the
+-- fogged wave in the lane; the live re-stand owns precision once it shows.
+local function clamp_intercept(cp, fwd, lane)
+    if not cp then return cp end
+    -- v0.1.323 BEST-POSITION CASTING (user doctrine): optional fwd pushes the meeting UP-LANE
+    -- (toward the enemy fountain, the same axis the clamp pulls on) BEFORE the band clamp -
+    -- the band caps the ratchet; computed per decide = frozen by construction (bug #5).
+    -- Folded INTO the clamp: the main chunk sits at Lua's 200-local limit, no new top-level locals.
+    if (fwd or 0) ~= 0 then
+        local fp0, ep0 = friendly_fountain_pos(), enemy_fountain_pos()
+        if fp0 and ep0 then
+            local fx, fy = ep0.x - fp0.x, ep0.y - fp0.y
+            local fl = math.sqrt(fx * fx + fy * fy)
+            if fl > 1 then cp = { x = cp.x + fx / fl * fwd, y = cp.y + fy / fl * fwd } end
+        end
+    end
+    local d = stand_depth(cp, lane)
+    local target = (d < -K.LANE_ANCHOR_BACK and -K.LANE_ANCHOR_BACK)
+                or (d > K.WALK_DEPTH_MAX and K.WALK_DEPTH_MAX) or nil
+    if not target then return cp end
     local fp, ep = friendly_fountain_pos(), enemy_fountain_pos()
-    if not (fp and ep and pos) then return 0 end
-    local mx, my = (fp.x + ep.x) * 0.5, (fp.y + ep.y) * 0.5     -- mid center
-    local ax, ay = ep.x - fp.x, ep.y - fp.y
-    local al = math.sqrt(ax * ax + ay * ay); if al < 1 then return 0 end
-    return (pos.x - mx) * (ax / al) + (pos.y - my) * (ay / al)
+    if not (fp and ep) then return cp end
+    local ux, uy = ep.x - fp.x, ep.y - fp.y
+    local ul = math.sqrt(ux * ux + uy * uy)
+    if ul <= 1 then return cp end
+    local pull = target - d
+    return { x = cp.x + ux / ul * pull, y = cp.y + uy / ul * pull }
 end
 -- Note 3: opts for Farm.StructuralRisk (fountains + the tagged contested-camp zones).
 local function risk_opts()
@@ -560,12 +611,16 @@ local function risk_opts()
 end
 -- Keen home = CAST_POSITION at the friendly fountain (CAST_NO_TARGET self-cast was
 -- issued-but-never-fired; CAST_POSITION is the order type that actually fires).
-local function keen_home()
+local function keen_home(purpose)
     local fp = friendly_fountain_pos()
     if not fp then return false end
     if cast_pos(State.keen, fp) then
         State.channelUntil = now() + K.KEEN_CHANNEL + K.CHANNEL_PAD
-        verify_cast("keen_home", State.keen)
+        -- keen-efficiency arc: purpose (return/panic/unstick) + from + mana ride the FIRED line
+        -- so --keen-report can tell a refill trip from a panic/unstick home (the home-cycle question)
+        local me = State.hero and origin(State.hero)
+        verify_cast("keen_home", State.keen, string.format(" purpose=%s from=(%.0f,%.0f) mana=%.0f",
+            purpose or "?", me and me.x or 0, me and me.y or 0, mana()))
         return true
     end
     return false
@@ -667,19 +722,29 @@ do
     -- keeps trying (the read only runs for visible enemies within breaker reach during a
     -- gate sweep, so the retry is cheap). Block-scoped (not per-call, not a chunk local):
     -- the gate runs per tick in try_rearm/keen/return paths.
-    local function enemy_ability_on_cd(ent, ability)
-        local ok, cd = pcall(function()
+    -- v0.1.272-273 (run-83, user rule: "the disable ability level has to be checked no
+    -- matter the hero level"): a breaker is CLEARED when it provably cannot fire. The
+    -- ABILITY level is the ground truth for every breaker (Lina LSA / Zeus Bolt are
+    -- basics - the ult shortcut never helps them); the hero-level ult fact only covers
+    -- unreadable/fogged ults, aged at the fastest-leveling bound (the .272 max-seen check
+    -- had a staleness hole: a Necro seen at 4 can be 6 after a long fog). Live reads on
+    -- visible enemies stamp observations (State.enObs); fogged heroes consume the fresh
+    -- stamps via ChannelGate.LevelCleared. Pre-6 Necro deferring every laning Rearm into
+    -- a 500u stepback round trip was the class this kills, at the one chokepoint.
+    local function read_breaker(ent, ability)   -- live level + cd, nil-safe (E2 probe style)
+        local ok, lvl, cd = pcall(function()
             local h = NPC.GetAbility and NPC.GetAbility(ent, ability)
-            return h and Ability.GetCooldown and Ability.GetCooldown(h)
+            if not h then return nil, nil end
+            return Ability.GetLevel and Ability.GetLevel(h),
+                   Ability.GetCooldown and Ability.GetCooldown(h)
         end)
-        if ok and type(cd) == "number" then
-            if not State.enCdProbeOk then State.enCdProbeOk = true; logline("en_cd_probe ok") end
-            -- ready WITHIN the channel window still breaks the channel: only a cd
-            -- longer than the horizon clears this breaker.
-            return cd > K.CHANNEL_GATE_HORIZON
-        end
-        if not State.enCdProbeNil then State.enCdProbeNil = true; logline("en_cd_probe nil") end
-        return false   -- unreadable = assume ready (conservative)
+        if not ok then return nil, nil end
+        lvl = (type(lvl) == "number") and lvl or nil
+        cd = (type(cd) == "number") and cd or nil
+        if lvl and not State.enLvlProbeOk then State.enLvlProbeOk = true; logline("en_lvl_probe ok") end
+        if cd then if not State.enCdProbeOk then State.enCdProbeOk = true; logline("en_cd_probe ok") end
+        elseif not State.enCdProbeNil then State.enCdProbeNil = true; logline("en_cd_probe nil") end
+        return lvl, cd
     end
     channel_threat_near = function(pt)
         if not pt then return nil end
@@ -690,15 +755,31 @@ do
             local ok, name = pcall(function() return NPC.GetUnitName and NPC.GetUnitName(h.entity) end)
             local br = ok and name and enemy_breakers(name)
             if br and h.pos then
+                State.enObs = State.enObs or {}
+                local obs = State.enObs[name]; if not obs then obs = { abil = {} }; State.enObs[name] = obs end
+                if h.visible then
+                    local ok2, hl = pcall(function() return NPC.GetCurrentLevel and NPC.GetCurrentLevel(h.entity) end)   -- the lib/hero_value-proven read
+                    if ok2 and type(hl) == "number" and hl > 0 then obs.hero = { lvl = hl, t = now() } end
+                end
                 local dx, dy = h.pos.x - pt.x, h.pos.y - pt.y
                 local d = math.sqrt(dx * dx + dy * dy)
                 for _, b in ipairs(br) do
+                    local cd
+                    if h.visible then
+                        local lvl
+                        lvl, cd = read_breaker(h.entity, b.ability)
+                        if lvl then obs.abil[b.ability] = { lvl = lvl, t = now() } end
+                    end
                     -- readiness judged at now()+horizon: a stamp expiring (or a live cd
                     -- ending) DURING our 1.2-2.93s channel is a ready breaker for it.
-                    if d <= b.range + K.CHANNEL_GATE_MARGIN + (h.probable_radius or 0)
-                       and ChannelGate.ReadyAt(State.castStamps or {}, name, b.ability, now() + K.CHANNEL_GATE_HORIZON)
-                       and not (h.visible and enemy_ability_on_cd(h.entity, b.ability)) then
-                        return name    -- a plausibly-READY breaker is in reach: gate the channel
+                    -- Only a cd longer than the horizon clears; level observations clear
+                    -- via LevelCleared (fresh ability-level-0, or the aged ult fact).
+                    if not ChannelGate.LevelCleared({ ability = b.ability, ult = b.ult },
+                                                    { abil = obs.abil[b.ability], hero = obs.hero }, now())
+                       and not (cd and cd > K.CHANNEL_GATE_HORIZON)
+                       and d <= b.range + K.CHANNEL_GATE_MARGIN + (h.probable_radius or 0)
+                       and ChannelGate.ReadyAt(State.castStamps or {}, name, b.ability, now() + K.CHANNEL_GATE_HORIZON) then
+                        return name, h.pos    -- a plausibly-READY breaker is in reach: gate the channel (pos: v0.1.267 step-back aiming)
                     end
                 end
             end
@@ -862,7 +943,8 @@ end
 --   0 visible -> keep the COR-1 fogged-proximity gate (don't keen into a fog gank).
 -- Under an enemy tower always flees. LANE paths only (shove gate, wave move/engage abort, safe_rearm);
 -- camps keep plain enemy_risk_at (jungle context).
-local function lane_unsafe(pos)
+local can_bail   -- v0.1.317 escape-gate; ASSIGNED after can_blink (below - lane_unsafe precedes the blink primitives). Forward-declared here.
+local function lane_unsafe(pos, opts)
     local p = Vector(pos.x, pos.y, 0)
     if enemy_tower_risk(p) >= K.SHOVE_SAFE_RISK then return true end
     -- CLEANUP(review#2): depth is now MEASUREMENT-only here (logged via srisk + ft.depth). The deep
@@ -870,32 +952,39 @@ local function lane_unsafe(pos)
     -- jungle. A hard lane_unsafe depth veto would recover BEFORE the guard, blocking the dive, so it was
     -- removed. (The crash-clamp already keeps a T1-alive stand in front of the tower.)
     local snap = State.fog or enemy_snapshot()
-    -- v0.1.95: count a GANK only within GANK_RADIUS (2 far enemies are not a gank).
-    -- v0.1.157 (glue review F4): FOGGED enemies count toward the GANK test - 1 visible + 1
-    -- recently-fogged is a 2-man gank, not a trade. v0.1.158 recalibration (the first run
-    -- aborted at risk 0.14): the raw probable disc reaches 2750u at the age cap, so stale
-    -- discs matched from half a screen away - fogged reach is now capped at GANK_FOG_REACH
-    -- (fresh info only), and fogged-only pairs do NOT gank (0 visible stays with the COR-1
-    -- fog gate below, as before F4); the fogged count only augments a VISIBLE enemy.
-    local nv, nf = 0, 0
+    -- v0.1.317 fog-threat (reachability + OPT-IN escape-gate): a FOGGED enemy augments the
+    -- gank count only when FRESH + its capped disc actually reaches p (Escape.ReachableFog);
+    -- and a 1-visible + reachable-fog "2-man" is tolerated when opts.bail is set AND Tinker
+    -- can BAIL (blink|keen + HP). Replaces the v0.1.157/.158 fixed GANK_FOG_REACH augmentation
+    -- that aborted full-HP 1v1 mids on any stale fog blip (the .316 jungle-drift). The
+    -- escape-gate is OPT-IN (shove sites only) so RAID callers (raid_safe/keen-landing) stay
+    -- strict until arc 2 gives them a blink-only bail (a raid spends keen). 2 VISIBLE always
+    -- bails; the nv==1 pure trade and nv==0 fogged-proximity branches are unchanged.
+    local nv = 0
     for _, h in ipairs(snap.heroes or {}) do
-        if h.pos then
+        if h.pos and h.visible then
             local dx, dy = h.pos.x - p.x, h.pos.y - p.y
-            local d = math.sqrt(dx * dx + dy * dy)
-            if h.visible then
-                if d <= K.GANK_RADIUS then nv = nv + 1 end
-            elseif d - math.min(h.probable_radius or 0, K.GANK_FOG_REACH) <= K.GANK_RADIUS then
-                nf = nf + 1
-            end
+            if math.sqrt(dx * dx + dy * dy) <= K.GANK_RADIUS then nv = nv + 1 end
         end
     end
-    if nv >= 2 or (nv >= 1 and nv + nf >= 2) then return true end
-    if nv == 1 then
+    if nv >= 2 then return true end                 -- 2 VISIBLE = committed gank, always bail
+    local rf = Escape.ReachableFog(snap, { x = p.x, y = p.y },
+        { radius = K.GANK_RADIUS, reach_cap = K.FOG_REACH_CAP, fresh_s = K.FOG_FRESH_S })
+    if nv >= 1 and nv + rf >= 2 then                -- 1 visible + a REACHABLE fresh fog = uncertain 2-man
+        local bail = (opts and opts.bail) and can_bail()
+        if (opts and opts.bail) and now() - (State.fogGateLogT or -9) > 2 then
+            State.fogGateLogT = now()
+            logline(string.format("fog_gate nv=%d rf=%d bail=%s -> %s", nv, rf,
+                tostring(bail), bail and "shove" or "abort"))
+        end
+        return not bail                             -- opt-in + healthy + escape up -> shove through
+    end
+    if nv == 1 then                                 -- pure 1v1 trade (no reachable fog) - unchanged
         local h0 = State.hero
         local hpf = (Entity.GetHealth(h0) or 1) / math.max(1, Entity.GetMaxHealth(h0) or 1)
         return hpf < K.LANE_TRADE_HP
     end
-    return enemy_risk_at(p) >= K.SHOVE_SAFE_RISK   -- 0 visible: fogged-proximity COR-1 gate (unchanged)
+    return enemy_risk_at(p) >= K.SHOVE_SAFE_RISK     -- 0 visible: fogged-proximity COR-1 gate (unchanged)
 end
 
 -- REBUILD: clear of EVERY alive enemy tower's attack range + a real margin = no tower damage AND no
@@ -991,6 +1080,45 @@ local function can_blink(kind)
     if blink_broken() or is_channeling() then return false end
     if now() - (State.lastBlinkT or -99) < K.BLINK_DEBOUNCE then return false end
     return true
+end
+
+-- v0.1.317 escape-gate: Tinker tolerates a REACHABLE fog threat (the fog-uncertain 2-man,
+-- shove sites only via opts.bail) only if he can bail - blink OR keen ready AND not
+-- burstable (HP >= the trade bar). can_blink already gates item+cd+blink-broken+channel
+-- (a damaged blink is NOT a bail). RAID callers do NOT pass opts.bail: a raid spends keen,
+-- so its bail is blink-only (arc 2). Assigns the forward-declared local above lane_unsafe.
+can_bail = function()
+    local h = State.hero
+    local hpf = (Entity.GetHealth(h) or 1) / math.max(1, Entity.GetMaxHealth(h) or 1)
+    if hpf < K.LANE_TRADE_HP then return false end
+    return can_blink("bail") or ready(State.keen)
+end
+
+-- v0.1.318 raid escape-gate: after a keen-DIVE keen is SPENT, so a raid's bail is
+-- blink-only (+ HP bar). Distinct from can_bail (which also counts keen).
+local function can_bail_raid()
+    local h = State.hero
+    local hpf = (Entity.GetHealth(h) or 1) / math.max(1, Entity.GetMaxHealth(h) or 1)
+    return hpf >= K.LANE_TRADE_HP and can_blink("bail")
+end
+
+-- v0.1.318 E3a PROXIMITY-REFIT (arc 2): the .313 raid veto (global missN, removed
+-- in .316) re-gated as PROXIMITY-aware - a raid to `dest` is vetoed only when a
+-- FRESH fogged enemy can actually reach the landing (Escape.ReachableFog) AND
+-- Tinker can NOT blink-bail. Closes the run-114 keen-into-fogged-enemies death
+-- without the global veto's predicate-hit-rate crippling. Reuses the lane fog
+-- constants to start - a deep dive may want a wider reach; watch keen-into-fog
+-- deaths and calibrate. Throttled raid_gate log.
+local function raid_gank_ok(dest)
+    local rf = Escape.ReachableFog(State.fog or enemy_snapshot(), dest,
+        { radius = K.GANK_RADIUS, reach_cap = K.FOG_REACH_CAP, fresh_s = K.FOG_FRESH_S })
+    if rf == 0 then return true end
+    local bail = can_bail_raid()
+    if now() - (State.raidGateLogT or -9) > 2 then
+        State.raidGateLogT = now()
+        logline(string.format("raid_gate rf=%d bail=%s -> %s", rf, tostring(bail), bail and "ok" or "veto"))
+    end
+    return bail
 end
 
 -- Cast blink toward dest, clamped into range so it FIRES (a cast beyond cast_range is issued-not-fired).
@@ -1455,6 +1583,10 @@ local function gather_candidates()
     local cands = {}
     local total, vis, est, seen, cleared = 0, 0, 0, 0, 0
     if not State.menu.kindJungle:Get() then State.funnel = {}; return cands end
+    -- v0.1.269 (run-81 t=26: a camp trip arrived BEFORE the 1:00 first spawn and read
+    -- arrive_empty): neutrals do not exist yet - no camp is a candidate. Generalizes the
+    -- .252 minute-0 STACK clamp to regular picks; 58 leaves the travel legal just before.
+    if now() < 58 then State.funnel = { total = 28, prespawn = true }; return cands end
     local neutrals = Map.AllNeutrals()                                      -- enumerate neutrals ONCE; box-filter per camp (was a full-map scan per camp)
     for _, cd in ipairs(Map.Camps()) do
         total = total + 1
@@ -1541,7 +1673,7 @@ local function safe_stand_for(meeting, forward, deep_ok, lane)
     local covers, cwhy = false, nil
     if not tower_safe(stand) then cwhy = "tower"
     elseif not Farm.MarchCovers(stand, meeting, reach) then cwhy = "cover"
-    elseif not (deep_ok or stand_depth(stand) <= K.WALK_DEPTH_MAX) then cwhy = "depth"
+    elseif not (deep_ok or stand_depth(stand, lane) <= K.WALK_DEPTH_MAX) then cwhy = "depth"
     elseif not (lane_leash_ok(stand, nil, lane) or raid_safe) then cwhy = "leash"
     else covers = true end
     return stand, covers, (not lane_unsafe(stand)), cwhy
@@ -1826,8 +1958,10 @@ local function keen_to_anchor(stand, include_creeps)
             for _, a in ipairs(anchors) do if a.name == "bldg" then nb = nb + 1 else no = no + 1 end end
             logline(string.format("anchors buildings=%d outposts=%d", nb, no))
         end
-        logline(string.format("keen_to_anchor anchor=%s land=(%.0f,%.0f) residual=%.0f cexcl=%d",
-            best.anchor.name, cl.x, cl.y, resid, State.creepExcl or 0))
+        -- keen-efficiency arc: jump (pre-cast hero pos -> landing) makes keen-vs-walk economics
+        -- judgeable from the log (the camp long-walk class rode unjudgeable residuals without it)
+        logline(string.format("keen_to_anchor anchor=%s land=(%.0f,%.0f) residual=%.0f cexcl=%d jump=%.0f mana=%.0f",
+            best.anchor.name, cl.x, cl.y, resid, State.creepExcl or 0, me:Distance(finalPos), mana()))
         return true
     end
     return keen_skip("cast_failed")   -- v0.1.233: the 4th silent exit (order not issued - channeling/silence/mana at fire time)
@@ -2324,16 +2458,9 @@ end
 -- tally allies per lane region (Lane._assign_lane): n = all allies, c = CORE allies (carry/mid/offlane).
 -- The wave contest yields a lane to a CORE ally (c>=1) OR 2+ allies (n>=2, XP split); a lone support
 -- (not core, n<2) does NOT block the lane - fixes Tinker abandoning his own lane to a support (Note 2).
-local function ally_lane_tally(allies)
-    local t = { top = { n = 0, c = 0 }, mid = { n = 0, c = 0 }, bot = { n = 0, c = 0 } }
-    for _, a in ipairs(allies or {}) do
-        if a.pos then
-            local e = t[Lane._assign_lane(a.pos)]
-            if e then e.n = e.n + 1; if a.core then e.c = e.c + 1 end end
-        end
-    end
-    return t
-end
+-- (v0.1.312: ally_lane_tally DELETED - its coarse Lane._assign_lane band marked a lane
+-- contested for a core anywhere in the map half; eval_side_lanes uses Farm.IsContestedByAlly
+-- proximity to the wave now, per the user's "don't farm what he is farming AT THE MOMENT".)
 
 local function gather_route_targets(allies, our_pri)
     local out = {}
@@ -2666,21 +2793,34 @@ local function schedule_ctx(lanes)
             pm = Lane.PredictMeeting({ pos = ew.front, speed = espd }, { pos = awv.front, speed = aspd })
         end
     end
-    local crash_pos = (pm and pm.point) or s.meeting
+    -- v0.1.303 LANE-CLOCK D-A (user-approved design, TINKER_LANE_SCHEDULING_STUDY.md): a FOGGED
+    -- lane-phase wave is a CLOCK event - it dispatches to the last OBSERVED arrival ground
+    -- (State.laneMeet, stamped at every real arrival) or the lane's front-tower midpoint
+    -- (s.meeting), NEVER to the mirror-kinematic meeting guess. The guess (err 300-1400u,
+    -- the v0.1.170 mirror study) fed the covers cascade and produced the fogged geometry-veto
+    -- class: 40 jungle-instead-of-lane picks across runs 104-107 and 3/5 misses in the .286
+    -- baseline itself (run-108, vetoes 1-2s before REAL arrivals). Visible waves keep the
+    -- kinematic meeting and every veto. Deep era (T1 down) keeps the old path entirely.
+    local t1m, t1malive = enemy_lane_t1(K.HOME_LANE)
+    local deep_era = not t1malive       -- v0.1.196: the DEEP-FARM era = their mid T1 DOWN. While it stands the lane phase owns everything (crash clamp, thin 400) - 100% untouched, per the user.
+    local crash_pos
+    if not visible and not deep_era then
+        local lm = State.laneMeet[K.HOME_LANE]
+        crash_pos = (lm and (now() - lm.t) <= K.LANE_MEET_TTL and { x = lm.x, y = lm.y })
+                    or s.meeting
+        crash_pos = clamp_intercept(crash_pos, K.INTERCEPT_FWD_R)   -- v0.1.315 two-sided clamp + v0.1.323 forward intercept: meet the wave UP-LANE inside the walk-farmable band (never past the stairs line, never deep our-side); the live re-stand corrects once it shows.
+    else
+        crash_pos = (pm and pm.point) or s.meeting
+    end
     if not crash_pos then return nil end
     -- CRASH CLAMP (user model): the meeting is BOUNDED by the enemy T1. If the estimate lands at/behind
     -- the (alive) enemy mid T1, our wave crashes the TOWER - aim AT the tower (Tinker stands WAVE_STANDBACK
     -- in front of it), never PAST it. This crashes the tower (the goal) AND stops the deep dives (note 2:
     -- walking under/past the tower). T1 dead -> no clamp; the depth/time gate (rule 2) decides the dive.
-    local deep_era = false
     local crashTwrPos                                       -- v0.1.246: the wave's tower terminus, when one exists
-    do
-        local t1, t1alive = enemy_lane_t1(K.HOME_LANE)
-        if t1alive and t1 and stand_depth(crash_pos) > stand_depth(t1) then
-            crash_pos = { x = t1.x, y = t1.y }
-            crashTwrPos = t1
-        end
-        deep_era = not t1alive          -- v0.1.196: the DEEP-FARM era = their mid T1 DOWN. While it stands the lane phase owns everything (crash clamp, thin 400) - 100% untouched, per the user.
+    if t1malive and t1m and stand_depth(crash_pos) > stand_depth(t1m) then
+        crash_pos = { x = t1m.x, y = t1m.y }
+        crashTwrPos = t1m
     end
     local eff_hp = (ew and ew.hp) or 0
     local present = visible
@@ -2704,8 +2844,8 @@ local function schedule_ctx(lanes)
         -- TINKER_ANCHOR_REACH_STUDY.md root cause B: mirror-kin ran 8-12s early on every fogged
         -- decide; the stamped grid err ~0 once lastWaveT existed).
         arrival, asrc = Schedule.NextWaveArrival(now(), K.WAVE_PERIOD, K.WAVE_PHASE, State.laneWaveT.mid), "stamp"
-    elseif pm then
-        arrival, asrc = now() + pm.eta, "kinest"   -- mirror kinematics, unstamped: scheduling only (the tether refuses to walk out on it)
+    elseif pm and deep_era then
+        arrival, asrc = now() + pm.eta, "kinest"   -- mirror kinematics, unstamped: DEEP-ERA only (v0.1.303 D-B: kinest timing ran 8-12s early, run-8; the lane phase trusts the spawn-clock grid)
     else
         arrival, asrc = Schedule.NextWaveArrival(now(), K.WAVE_PERIOD, K.WAVE_PHASE, State.laneWaveT.mid), "grid"
     end
@@ -2767,6 +2907,7 @@ local function schedule_ctx(lanes)
     -- the safety rules are unchanged (raid_safe / lane_unsafe / landing gates).
     local raidcap = ((State.keen and Ability.GetLevel and Ability.GetLevel(State.keen)) or 0) >= 2
                     and (ready(State.keen) or ready(State.rearm)) and awv and (awv.count or 0) > 0
+                    and raid_gank_ok(crash_pos)   -- v0.1.318 E3a PROXIMITY-REFIT (arc 2): raid vetoed only when a FRESH fogged enemy reaches the landing AND no blink-bail (replaces the .313 global missN veto removed in .316; closes run-114 without the hit-rate crippling)
                     and raid_hop_ok(crash_pos)   -- v0.1.253: the cap is only legal when the hop it prices actually exists (run-69 churn)
     if raidcap then
         local transit = (ready(State.keen) and 0 or rearm_channel()) + K.KEEN_CHANNEL + 1.5
@@ -2804,6 +2945,12 @@ local function schedule_ctx(lanes)
             if dpts > K.DEPTH_POINT_BUDGET then covers = false; cwhy = "dpts" end
         end
     end
+    -- v0.1.303 LANE-CLOCK D-A: ESTIMATES NEVER VETO (the v0.1.241 thin law, extended to the
+    -- whole chain). The fogged lane-phase dispatch ground is observed/equilibrium and composed
+    -- tower-safe + walkable above - the cascade verdicts (tower/cover/depth/leash/dpts) were
+    -- evaluating a position GUESS. Real reads keep full authority: tower_dying below, the live
+    -- re-stand once the wave shows, and every veto on VISIBLE waves.
+    if not visible and not deep_era and stand then covers, cwhy = true, nil end
 
     -- gone-by-arrival BIDIRECTIONAL (v0.1.193, user: "the fight sim should calculate on either
     -- direction"). bal < 0 pushed arrival to fight-end above (asrc=sim, their remnant emerges);
@@ -2841,7 +2988,7 @@ local function schedule_ctx(lanes)
     -- gank corridor; sample the straight hero->stand route and treat a hot corridor as unsafe too.
     local prisk = Farm.PathRisk({ x = me.x, y = me.y }, stand,
         function(pt) return enemy_risk_at(Vector(pt.x, pt.y, 0)) end)
-    local shove_safe = (not lane_unsafe(stand)) and prisk < K.PATH_RISK_MAX   -- v0.1.94 count+HP aware point check + the corridor
+    local shove_safe = (not lane_unsafe(stand, { bail = true })) and prisk < K.PATH_RISK_MAX   -- v0.1.94 count+HP aware; v0.1.317 bail=true (mid shove site): the fog-uncertain escape-gate
     local emd = effective_march_dmg()                       -- N5: live LEVEL-AWARE per-March damage (not the flat MARCH_DMG_PER_CAST)
     local cal = { march_dmg_per_cast = (emd > 0 and emd) or K.MARCH_DMG_PER_CAST, cast_dur = K.MARCH_CAST_DUR,
                   robot_kill = K.ROBOT_KILL, rearm_channel = rearm_channel(), lead = K.SCHED_LEAD }
@@ -2949,15 +3096,23 @@ local function side_wave_ctx(lane, s)
     if not (visible or pm or stamp_fresh) then
         return nil, (stampT and "stale" or "fogged")
     end
-    local crash_pos = (pm and pm.point) or s.meeting
+    -- v0.1.303 LANE-CLOCK D-A, side twin (see mid): fogged lane-phase ground = observed
+    -- arrival (laneMeet) or the lane midpoint, never the mirror guess.
+    local st1, st1alive = enemy_lane_t1(lane)
+    local crash_pos
+    if not visible and st1alive then
+        local lm = State.laneMeet[lane]
+        crash_pos = (lm and (now() - lm.t) <= K.LANE_MEET_TTL and { x = lm.x, y = lm.y })
+                    or s.meeting
+        crash_pos = clamp_intercept(crash_pos, nil, lane)   -- v0.1.315 two-sided intercept clamp (see mid); v0.1.327 the SIDE lane's own depth zero
+    else
+        crash_pos = (pm and pm.point) or s.meeting
+    end
     if not crash_pos then return nil, "fogged" end
     local crashTwrPos                                        -- v0.1.246: the wave's tower terminus, when one exists
-    do  -- crash clamp at THIS lane's alive enemy T1 (same rule as mid)
-        local t1, t1alive = enemy_lane_t1(lane)
-        if t1alive and t1 and stand_depth(crash_pos) > stand_depth(t1) then
-            crash_pos = { x = t1.x, y = t1.y }
-            crashTwrPos = t1
-        end
+    if st1alive and st1 and stand_depth(crash_pos, lane) > stand_depth(st1, lane) then   -- crash clamp at THIS lane's alive enemy T1 (same rule as mid; v0.1.327 the lane's own zero, relative so it cancels anyway)
+        crash_pos = { x = st1.x, y = st1.y }
+        crashTwrPos = st1
     end
     local eff_hp = (ew and ew.hp) or 0
     -- PHASE 2: thin fires on REAL reads only (Schedule.Plan's own thin rule is already
@@ -2970,7 +3125,8 @@ local function side_wave_ctx(lane, s)
     elseif visible then arrival, asrc = now(), "vis"
     elseif stamp_fresh then                                  -- PHASE 2: measured cadence beats the unstamped mirror (mid ladder parity, run-8)
         arrival, asrc = Schedule.NextWaveArrival(now(), K.WAVE_PERIOD, K.WAVE_PHASE, stampT), "stamp"
-    else arrival, asrc = now() + pm.eta, "kinest" end        -- unstamped mirror kinematics (commit allowed, phase-1 semantics; source is live by construction)
+    elseif not st1alive then arrival, asrc = now() + pm.eta, "kinest"   -- unstamped mirror kinematics: DEEP-ERA only (v0.1.303 D-B, same as mid)
+    else arrival, asrc = Schedule.NextWaveArrival(now(), K.WAVE_PERIOD, K.WAVE_PHASE, stampT), "grid" end
     local bal, gone_fight_rel
     if awv and ew and not ew.estimated then                  -- REAL waves only (the mirrored-estimate bal misfire, v0.1.153)
         local pf = Lane.PushForecast(awv, ew, { cycle = math.min(30, math.floor(now() / 450)),
@@ -2992,6 +3148,7 @@ local function side_wave_ctx(lane, s)
     local travel = (itc and itc.eta) or (me:Distance(Vector(crash_pos.x, crash_pos.y, me.z)) / math.max(150, ms))
     local raidcap = ((State.keen and Ability.GetLevel and Ability.GetLevel(State.keen)) or 0) >= 2
                     and (ready(State.keen) or ready(State.rearm)) and awv and (awv.count or 0) > 0
+                    and raid_gank_ok(crash_pos)   -- v0.1.318 E3a proximity-refit (see mid)
                     and raid_hop_ok(crash_pos)   -- v0.1.253: the cap is only legal when the hop it prices actually exists (run-69 churn)
     if raidcap then
         local transit = (ready(State.keen) and 0 or rearm_channel()) + K.KEEN_CHANNEL + 1.5
@@ -3012,6 +3169,7 @@ local function side_wave_ctx(lane, s)
     local fwd = not lane_unsafe({ x = crash_pos.x, y = crash_pos.y })
     local stand, covers, _safe, cwhy = safe_stand_for(crash_pos, fwd, raidcap, lane)
     if not stand then return nil, "no_stand" end
+    if not visible and st1alive then covers, cwhy = true, nil end   -- v0.1.303 D-A: estimates never veto (side twin; dpts below still measures)
     local dpts = 0
     do
         local info = enemy_t1_points_info(stand)   -- nearest enemy T1 = this lane's, by construction
@@ -3021,7 +3179,7 @@ local function side_wave_ctx(lane, s)
                 line_alive = info.line_alive, side_t1_up = info.others_up,
                 shave = (kl >= 2 and ready(State.keen)) and K.DEPTH_KEEN_SHAVE or 0,
             })
-            if dpts > K.DEPTH_POINT_BUDGET then covers = false; cwhy = "dpts" end
+            if dpts > K.DEPTH_POINT_BUDGET and not (not visible and st1alive) then covers = false; cwhy = "dpts" end   -- v0.1.303: the dpts veto is a REAL-stand read but keyed off an estimated ground when fogged - lane phase bypasses (mid parity)
         end
     end
     local gone = (gone_fight_rel and not (covers and travel < gone_fight_rel)) and true or false
@@ -3029,7 +3187,7 @@ local function side_wave_ctx(lane, s)
     if srisk > 1 then srisk = 1 end
     local prisk = Farm.PathRisk({ x = me.x, y = me.y }, stand,
         function(pt) return enemy_risk_at(Vector(pt.x, pt.y, 0)) end)
-    local shove_safe = (not lane_unsafe(stand)) and prisk < K.PATH_RISK_MAX
+    local shove_safe = (not lane_unsafe(stand, { bail = true })) and prisk < K.PATH_RISK_MAX   -- v0.1.317 bail=true (side shove site)
     local emd = effective_march_dmg()
     local cal = { march_dmg_per_cast = (emd > 0 and emd) or K.MARCH_DMG_PER_CAST, cast_dur = K.MARCH_CAST_DUR,
                   robot_kill = K.ROBOT_KILL, rearm_channel = rearm_channel(), lead = K.SCHED_LEAD }
@@ -3089,9 +3247,14 @@ local function dispatch_shove(lane, sc, casts, ref)
         waveAsrc = sc.asrc,                           -- v0.1.218: the arrival's source - asrc=sim means waveEta IS the fight end (the bal<0 farmable moment)
         crashTowerKey = sc.crash_tower_key,           -- v0.1.246: the wave's tower terminus; dies mid-commit -> the fsm_move_wave tripwire redecides
     }
+    if (lane or K.HOME_LANE) == K.HOME_LANE then
+        State.lastWaveStand = { x = sc.stand.x, y = sc.stand.y, t = now() }   -- v0.1.328: the idle pre-position home (the none-state holds HERE, not wherever it froze; side shoves do not move the home)
+    end
     State.marchCasts, State.fsm = 0, "MOVE"
+    State.keenedSpot = false   -- v0.1.286 (run-94 1:30 cross-map walks): a NEW commit is a NEW leg - the stale latch skipped the keen rung and walked 7700+ (why=latched)
     State.moveSince = now(); State.moveTrack = nil
     State.keenedSpot = false; State.marchPending = nil; State.emptySince = nil
+    State.rearmStepback = nil; State.chanDeferSince = nil   -- v0.1.314 (bug hunt): a step-back / channel-defer belongs to the OLD commit's engage - the camp commit already clears rearmStepback, the wave commit leaked both onto the next wave
 end
 
 -- ALL-LANES side-lane evaluation (extracted v0.1.229 - ONE producer for the Tier-1.5
@@ -3100,14 +3263,28 @@ end
 -- returns (best {lane, risk, gold, casts}, bestCtx) or nil. Selection = lowest composed
 -- stand risk, gold tiebreak (the validated v0.1.227 rule).
 local function eval_side_lanes(lanes, allies, window, ft)
-    local tally = ally_lane_tally(allies)       -- core-or-2+ yield (reused; dormant since the mid contest)
+    -- v0.1.314 (bug hunt finding: the v0.1.312 contest gated on a.value >= CONTEST_CORE_BASE,
+    -- but a.value = FarmPriority = base * live_mult / 1.6 [role() returns nil], so the test was
+    -- effectively base*live_mult >= 0.88 = only a CARRY at even stats; every other core
+    -- [nuker/pusher/durable/disabler] under-fired -> Tinker crashed their lane. The CORRECT
+    -- predicate a.core = IsCore [base >= CONTEST_CORE_BASE] is already computed - use it.)
+    local core_allies = {}
+    for _, a in ipairs(allies or {}) do if a.core then core_allies[#core_allies + 1] = a end end
     local best, bestCtx = nil, nil
     local sw = { top = { v = "off", r = -1 }, bot = { v = "off", r = -1 } }
     for _, ln in ipairs({ "top", "bot" }) do
         local verdict
         local sctx, why = side_wave_ctx(ln, lanes[ln])
         if not sctx then verdict = why
-        elseif tally[ln] and (tally[ln].c >= 1 or tally[ln].n >= 2) then verdict = "contested"
+        -- v0.1.312 (user, run-114: the safe lane was EMPTY, wave free at the tower, but read
+        -- contested): the old ally_lane_tally used Lane._assign_lane = a coarse x-y DIAGONAL
+        -- BAND covering the whole map half, so a core ANYWHERE in the bottom half (jungle,
+        -- base, Roshan) marked the safe lane contested. User's doctrine: "not stealing carry
+        -- farm = don't farm what he is farming AT THE MOMENT" - contest is PROXIMITY to THIS
+        -- wave's ground, not a lane label. A core ally within CONTEST_LANE_R of the crash
+        -- point = he is on this wave -> yield; absent = take it.
+        elseif Farm.IsContestedByAlly(sctx.crash_pos, core_allies,
+                   { radius = K.CONTEST_LANE_R }) then verdict = "contested"   -- v0.1.314: proximity over PRE-FILTERED cores (a.core), not a value threshold on the fed-scaled priority
         else
             local sd = Schedule.Plan(sctx.plan)
             if sd.action ~= "shove" then
@@ -3152,17 +3329,28 @@ local function fsm_decide()
     State.fog = enemy_snapshot()             -- snapshot enemies ONCE per decide (enemy_risk_at reads it)
     State.refillNeed = nil                   -- cost-aware refill: valid only for the trip its dispatch starts (re-set below when the pick is refill; a stale need must never inflate an unrelated RETURN)
 
+    -- E3a MISSINGCOUNT (v0.1.313 CORRECTED - the bug hunt proved the v0.1.311 re-apply was
+    -- INERT on both axes): use the tested pure lever Escape.MissingCount = enemies in the
+    -- snapshot marked visible==false (HIDING with a known last-position = the classic
+    -- missing-on-the-map gank signal, the pro "<=1 of 5 missing is safe to deep-farm"
+    -- doctrine). The v0.1.311 roster-diff counted the WRONG set: a fogged hero STAYS in the
+    -- snapshot as visible=false and was counted as "seen", so missN only rose for DEAD or
+    -- never-seen enemies = zero signal in the everyone-hiding case, and +risk in the wrong
+    -- direction after a team wipe. And its additive prisk bump (max 0.24) could never cross
+    -- the 0.42 gate on a clean corridor. Now the count GATES the RAID directly (below).
+    State.missN = Escape.MissingCount(State.fog)
+
     -- v0.1.91 instrument: ONE consolidated `farm` trace per decide. Supersedes the piecemeal
     -- sched/jungle/funnel/decide-pick string logs - this single event ALONE explains each choice and
     -- feeds the offline per-wave accounting (tools/parse_debuglog.lua --farm-report). Logging-only.
-    local ft = { t = string.format("%.1f", now()) }
+    local ft = { t = string.format("%.1f", now()), miss = State.missN }
     -- (ft.fb A/B tag retired with the T0 collapse - one engine now)
     local function emit_farm(pick) ft.pick = pick; tlog(1, "farm", ft) end
     local stuckWindow = false   -- v0.1.158: a suppressed shove falls through to the planner with a capped horizon
 
     -- Tier-1 timing scheduler: decide shove / jungle(slack) / recover before the jungle planner.
     -- (allies/our_pri hoisted above the Tier-1 block at v0.1.227: the Tier-1.5 side-lane
-    -- cascade needs ally_lane_tally; the jungle planner below reuses them unchanged.)
+    -- cascade needs allies/our_pri; the jungle planner below reuses them unchanged.)
     local allies  = ally_farm_priorities()
     local our_pri = our_farm_priority()
     State.schedSlack, State.shoveLeaveBy, State.shoveTravel = nil, nil, nil
@@ -3452,6 +3640,21 @@ local function fsm_decide()
             if me:Distance(Vector(w.x, w.y, me.z)) > K.WAVE_HOLD_EPS then
                 move_to(Vector(w.x, w.y, me.z), "idle_retreat")
             end
+        else
+            -- v0.1.328 THE IDLE PRE-POSITION (churn arc step 1; user doctrine "back before the
+            -- next wave"): a none pick used to FREEZE wherever the last action left him - the
+            -- g326/g327 none-flutter read on screen as fixed-under-the-tower whenever no commit
+            -- existed (78% of g326's decides). The idle state IS the pre-position now: hold the
+            -- last HOME-lane wave stand (stamped at dispatch_shove, fresh < 60s). The gank branch
+            -- above keeps the protected retreat; WAVE_HOLD_EPS stops the move-order twitch on
+            -- the 0.4s flutter re-decides (they all land on this same hold).
+            local lw = State.lastWaveStand
+            if lw and (now() - (lw.t or 0)) < 60 then
+                local wv = Vector(lw.x, lw.y, me.z)
+                if me:Distance(wv) > K.WAVE_HOLD_EPS then
+                    move_to(wv, "idle_prepos")
+                end
+            end
         end
         -- v0.1.163 (user): the none-idle is a deliberate wait too (suppression / no target fits)
         State.waitInfo = { why = stuckWindow and "suppressed" or "window", t = now() }
@@ -3473,6 +3676,7 @@ local function fsm_decide()
         c.aggroAt, c.fleeUntil, c.aggroed = first.stackWin.aggro_at, first.stackWin.done, false
         c.clearEst, c.planCost = first.clear_t or 0, 0
         State.spot, State.marchCasts, State.fsm = c, 0, "MOVE"
+    State.keenedSpot = false   -- v0.1.286 (run-94 1:30 cross-map walks): a NEW commit is a NEW leg - the stale latch skipped the keen rung and walked 7700+ (why=latched)
         State.moveSince = now()
         ft.ctype, ft.cgold = c.type, math.floor(c.gold or 0)
         ft.sx, ft.sy = string.format("%.0f", st.x), string.format("%.0f", st.y)
@@ -3527,8 +3731,10 @@ local function fsm_decide()
     local spot = c
 
     State.spot, State.marchCasts, State.fsm = spot, 0, "MOVE"
+    State.keenedSpot = false   -- v0.1.286 (run-94 1:30 cross-map walks): a NEW commit is a NEW leg - the stale latch skipped the keen rung and walked 7700+ (why=latched)
     State.moveSince = now()
     State.moveTrack = nil   -- reset the P0 no-progress watchdog for the new spot
+    State.rearmStepback = nil   -- v0.1.267: a step-back belongs to the OLD spot's engage
     State.keenedSpot = false
     State.marchPending = nil
     State.emptySince = nil
@@ -3589,7 +3795,12 @@ local function update_wave_spot(s)
             -- keen lands deep, keen is on cd; requiring ready would clamp the live stand back to
             -- the stairs and walk him out of his own engage).
             local dok = s.shove and ((State.keen and Ability.GetLevel and Ability.GetLevel(State.keen)) or 0) >= 2
-            local st, cov = safe_stand_for(ranged, not lane_unsafe({ x = ranged.x, y = ranged.y }), dok, s.lane)
+            -- W-GEOM-1 (was: forward = not lane_unsafe(ranged), the F19 contested flag): the live
+            -- stand ALWAYS anchors the ranged at the standard 810. The old contested fallback stood
+            -- 900 from the ranged = the exact coverage edge (casts at 100% reach = the ranged
+            -- surviving "by a little"). Contested safety is owned by the risk gates (lane_unsafe
+            -- aborts the engage; enemy_risk gates the shove), not by 90u past guaranteed coverage.
+            local st, cov = safe_stand_for(ranged, true, dok, s.lane)
             if st and cov then
                 s.standSpot.aim = Vector(ranged.x, ranged.y, z)
                 s.standSpot.stand = Vector(st.x, st.y, z)
@@ -3706,7 +3917,7 @@ local function lane_go(dest, raid)
     -- at the line (the v0.1.192 freeze): reject the whole action, force a redecide (Plan then
     -- excludes the target properly), suppress the flutter, and log LOUDLY - every deep_reject
     -- line in a log is a bug report with the caller's coordinates in it.
-    if not raid and (stand_depth(dest) > K.WALK_DEPTH_MAX + 50 or not lane_leash_ok(dest, 50, State.spot and State.spot.lane)) then   -- v0.1.202: raid legs exempt from the leash too (ungankable raids re-sanctioned; the dispatch is covers-gated upstream)
+    if not raid and (stand_depth(dest, State.spot and State.spot.lane) > K.WALK_DEPTH_MAX + 50 or not lane_leash_ok(dest, 50, State.spot and State.spot.lane)) then   -- v0.1.202: raid legs exempt from the leash too (ungankable raids re-sanctioned; the dispatch is covers-gated upstream)
         logline(string.format("lane_go deep_reject (%.0f,%.0f) depth=%.0f -> redecide (UPSTREAM BUG)",
             dest.x, dest.y, stand_depth(dest)))
         suppress_shove(State.spot and State.spot.lane, now() + K.SHOVE_STUCK_S)
@@ -3719,6 +3930,16 @@ local function lane_go(dest, raid)
     end
     sdest = snap_walkable(sdest, dest)
     local sv = Vector(sdest.x, sdest.y, me.z)
+    -- v0.1.286 (run-94 9:34/10:50/15:00, user: a blink followed by a keen is a wasted
+    -- dagger - "plausible only when returning to base"): a leg whose keen is still
+    -- COMING (exists, leveled, not yet spent/refused for this spot) never travel-blinks;
+    -- the keen is global, the blink buys nothing. keenedSpot latches on spend AND on
+    -- geometry refusals, so the blink stays available when the keen truly cannot serve
+    -- the leg. A mana-short keen counts as coming (the .232 case: funding arrives
+    -- mid-leg via bottle/regen). Return-path blinks (fsm_return) are untouched.
+    local function blink_ok()
+        return State.keenedSpot or (((State.keen and Ability.GetLevel and Ability.GetLevel(State.keen)) or 0) < 1)
+    end
     -- v0.1.205 (user directive, REVERSES the v0.1.158 note 6 "no blink in lane"): blink IS a lane
     -- travel rung now - the walking-distance-only usage under-used the dagger ("shaving even 3
     -- seconds can mean one more camp or clear the lane"). The jump-risk veto lives INSIDE
@@ -3798,16 +4019,37 @@ local function lane_go(dest, raid)
             -- it, 4x - the user's "keen to T2 did not blink on position"): the raid blink-exclusion
             -- applies only BEFORE the leg's keen (the creep hop IS the transport); once the keen is
             -- spent (State.keenedSpot) the residual is an ordinary sanctioned walk - blink it.
-            if (not raid or (State.keenedSpot and me:Distance(sv) >= 800)) and try_travel_blink(sv) then logline("lane_go blink"); return "blink" end
+            if blink_ok() and (not raid or me:Distance(sv) >= 800) and try_travel_blink(sv) then logline("lane_go blink"); return "blink" end
             if safe_rearm() then logline("lane_go rearm_reset_keen"); return "rearm" end
         else
             -- v0.1.209 review fix + v0.1.212: same raid rule (pre-keen only) as the rearm rung.
-            if (not raid or (State.keenedSpot and me:Distance(sv) >= 800)) and try_travel_blink(sv) then logline("lane_go blink"); return "blink" end
+            if blink_ok() and (not raid or me:Distance(sv) >= 800) and try_travel_blink(sv) then logline("lane_go blink"); return "blink" end
             return walk_or_wait()
         end
     end
-    if (not raid or (State.keenedSpot and me:Distance(sv) >= 800)) and try_travel_blink(sv) then logline("lane_go blink"); return "blink" end
+    if blink_ok() and (not raid or me:Distance(sv) >= 800) and try_travel_blink(sv) then logline("lane_go blink"); return "blink" end
     return walk_or_wait()
+end
+
+-- W-GEOM-2/3 shared cross-arm cast target (v0.1.277): ONE builder for the engage cast and
+-- the preemptive lead cast. Returns the clamped cast point + the arm's theta; the CALLER
+-- flips State.wArm only on cast success (the v0.1.176 latch lesson).
+local function march_cross_target(me, aim)
+    local maxr = (K.MARCH_CAST_RANGE or 300) - 20
+    local theta = (State.wArm == 2) and K.W_X_ARM_B or K.W_X_ARM_A
+    local dx, dy = aim.x - me.x, aim.y - me.y
+    local dl = math.sqrt(dx * dx + dy * dy)
+    local tgt
+    if dl > 1 then
+        local th = math.rad(theta)
+        local ct, st = math.cos(th), math.sin(th)
+        local ux, uy = dx / dl, dy / dl
+        local d = math.min(maxr, dl)
+        tgt = Vector(me.x + (ux * ct - uy * st) * d, me.y + (ux * st + uy * ct) * d, aim.z)
+    else
+        tgt = Vector(aim.x, aim.y, aim.z)
+    end
+    return (me:Distance(tgt) > maxr) and (me + (tgt - me):Normalized() * maxr) or tgt, theta
 end
 
 -- Wave MOVE: track the live wave (re-aim the stand at the moving cluster), close the distance via
@@ -3832,13 +4074,58 @@ local function fsm_move_wave(s)
     -- tick and bail+recover when it turns dangerous; suppress re-shoving the same spot briefly.
     local hrisk = enemy_risk_at(origin(State.hero))
     -- (the v0.1.123 live too_deep abort was REMOVED 2026-07-01 with the depth-veto patch family.)
-    if lane_unsafe(origin(State.hero)) then             -- v0.1.94: 2+ enemies / under-tower / low-HP 1v1 (not a healthy 1v1 trade)
+    if lane_unsafe(origin(State.hero), { bail = true }) then   -- v0.1.94: 2+ enemies / under-tower / low-HP 1v1; v0.1.317 bail=true: the fog-uncertain escape-gate (the .316 jungle-drift)
         try_escape_blink()                              -- primary: flee by blink BEFORE the burst; recover regardless
         suppress_shove(s.lane, now() + K.SHOVE_STUCK_S)
         State.spot = nil; State.fsm = "DECIDE"; State.moveSince = nil
         logline(string.format("wave_move abort reason=unsafe risk=%.2f", hrisk)); return
     end
+    -- v0.1.329 THE CONTEST ARRIVAL RE-CHECK (user order; the .312 law enforced IN-FLIGHT):
+    -- the decide-time contest passes when the carry is >CONTEST_LANE_R from the wave or
+    -- arrives during Tinker's travel - g328: 2 top picks swtop=ok, then 79s top for 43g with
+    -- the user's carry there. SIDE lanes only (mid = HOME, never yielded to allies);
+    -- PRE-INVESTMENT only (marchCasts 0, no pending - a paid wave finishes W2 and banks via
+    -- the budget exit); ~1s throttle (an ally scan per tick is waste). Contested -> the
+    -- established brief-suppress + redecide pattern (same as overdue_convert); the next wave
+    -- re-competes fresh at the decide's own contest gate.
+    if s.shove and s.lane and s.lane ~= K.HOME_LANE
+       and (State.marchCasts or 0) == 0 and not State.marchPending
+       and now() - (s.contestT or 0) >= 1.0 then
+        s.contestT = now()
+        local cores = {}
+        for _, a in ipairs(ally_farm_priorities()) do
+            if a.core then cores[#cores + 1] = a end
+        end
+        local ground = s.refPoint or (s.standSpot and s.standSpot.aim)
+        if #cores > 0 and ground
+           and Farm.IsContestedByAlly({ x = ground.x, y = ground.y }, cores, { radius = K.CONTEST_LANE_R }) then
+            logline(string.format("contest_abandon lane=%s", tostring(s.lane)))
+            suppress_shove(s.lane, now() + K.SHOVE_STUCK_S)
+            State.spot = nil; State.fsm = "DECIDE"; State.moveSince = nil
+            State.marchPending = nil
+            return
+        end
+    end
     local live = update_wave_spot(s)
+    -- v0.1.275 (run-84 user sighting: "going back and forward in a frenetic way while
+    -- waiting"): a wave FLICKERING at the vision edge alternated the FOGGED branch (enemy
+    -- near the stand -> protected hold toward the tower) with the LIVE branch (re-approach
+    -- the stand) EVERY TICK - two lane_go destinations ~1700 apart, order for order
+    -- (run-84 t=221/282/430/697, flip period ~0.3s). Debounce the branch: the contrary
+    -- visibility state must persist WAVE_VIS_DEBOUNCE_S before the switch; transient
+    -- contrary ticks issue NOTHING (the standing posture's last order keeps walking, the
+    -- engage triggers resume within the debounce). Both flip directions guarded.
+    do
+        local rawLive = live and true or false
+        if s.visState == nil then s.visState = rawLive end
+        if rawLive ~= s.visState then
+            s.visPendT = s.visPendT or now()
+            if now() - s.visPendT < K.WAVE_VIS_DEBOUNCE_S then return end
+            s.visState, s.visPendT = rawLive, nil
+        else
+            s.visPendT = nil
+        end
+    end
     -- note 2 (v0.1.160): the wave OBSERVED arriving after an empty wait = the REAL arrival - stamp it
     -- for the cadence anchor. waveEta alone lied on fogged anticipatory shoves (the mirror reads "due
     -- now" up to ~13s early), so lastWaveT inherited the bias and the measured rhythm scheduled camp
@@ -3849,6 +4136,29 @@ local function fsm_move_wave(s)
     -- near the stand (the in-and-out; landing fully gated in keen_to_anchor, degrades to a
     -- building anchor when unsafe = the tether path). Shared by both branches (v0.1.173).
     local raidok = s.shove and ((State.keen and Ability.GetLevel and Ability.GetLevel(State.keen)) or 0) >= 2
+    -- v0.1.280 THE IMMEDIATE W2 REARM (user directive, run-88: "cast first W and rearm
+    -- directly if it is safe, then when the wave is visible cast the next W" - the old
+    -- flow started the 2.75s channel only at ARRIVAL, pure delay). Resolve the in-flight
+    -- preempt here (was engage-only; the cd jump proves the cast fired), then rearm
+    -- straight away, safe-gated (channel gate + backoff inside safe_rearm) and at-stand
+    -- only (the hold-still keeps the channel unbroken; a walking rearm self-cancels).
+    do
+        local mp = State.marchPending
+        if mp and (not ready(State.march) or cd_remaining(State.march) > mp.cdBefore + 0.05) then
+            State.marchCasts = (State.marchCasts or 0) + 1; State.marchPending = nil
+            logline("march cast=" .. State.marchCasts)
+        elseif mp and now() > mp.expire then
+            State.marchPending = nil   -- v0.1.314 (bug hunt A4): a cast_pos-true-but-unfired pending was cleared only by the ENGAGE resolver - in MOVE it stalled every subsequent W block until arrival. Same expire clear as ENGAGE now.
+        end
+        local me1 = origin(State.hero)
+        if (State.marchCasts or 0) == 1 and not State.marchPending and not ready(State.march)
+           and (me1:Distance(s.standSpot.stand) <= K.W_PRE_STAND_R
+                or channel_threat_near({ x = s.standSpot.stand.x, y = s.standSpot.stand.y }))   -- v0.1.307 the rearm dance: a disabler forced the step-back beyond the stand ring - rearm wherever the gate clears
+           and effective_mana() >= abil_mana(State.rearm, K.REARM_MANA_FB) + abil_mana(State.march, K.MARCH_MANA_FB)
+           and safe_rearm() then
+            logline("prearm_w2"); return
+        end
+    end
     if not live then
         -- A shove heads toward the predicted crash point even while fogged, but NEVER waits forward
         -- (task #12, TINKER_ANCHOR_TETHER_DESIGN.md): hold TETHERED at the protected spot (nearest
@@ -3883,6 +4193,7 @@ local function fsm_move_wave(s)
                     now() - (s.waveEta or State.emptySince or now())))
                 if s.shove then suppress_shove(s.lane, now() + K.SHOVE_STUCK_S) end
                 State.spot = nil; State.fsm = "DECIDE"; State.moveSince = nil
+                State.marchPending = nil   -- v0.1.278: a fog-preempt on a no-show wave must not leak into the next engage's count
                 return
             end
             local nxt = Schedule.NextWaveArrival(now(), K.WAVE_PERIOD, K.WAVE_PHASE, State.laneWaveT[s.lane or K.HOME_LANE])   -- PHASE 2: the hold's own lane cadence (side holds used MID's stamp before - wrong lane phase)
@@ -3891,6 +4202,7 @@ local function fsm_move_wave(s)
                 logline(string.format("wave_wait extend eta=%.1f", nxt))
             else
                 State.spot = nil; State.fsm = "DECIDE"; State.moveSince = nil
+                State.marchPending = nil   -- v0.1.278: same pending-leak guard as overdue_convert
                 logline("shove_move no_wave -> redecide"); return
             end
         end
@@ -3901,21 +4213,21 @@ local function fsm_move_wave(s)
                 and Schedule.NextWaveArrival(now(), K.WAVE_PERIOD, K.WAVE_PHASE, State.laneWaveT[s.lane or K.HOME_LANE]) or nil   -- PHASE 2: per-lane
             -- v0.1.213 TIMED MEETING RAID: the pre-empt target is the EARLIER of the cadence eta
             -- and the sim's meeting time (fight start) - land as the waves collide.
-            if s.meetEta then eta_live = eta_live and math.min(eta_live, s.meetEta) or s.meetEta end
+            if s.meetEta and (raidok or not eta_live) then eta_live = eta_live and math.min(eta_live, s.meetEta) or s.meetEta end   -- v0.1.321: the min-PULL to meetEta is RAID-ONLY (raid pre-empt target :3223; fogged mirror-kin runs 8-12s early :2820, the stamp is the accurate clock), but the NO-STAMP bootstrap (eta_live nil -> meetEta) stays for ALL shoves (.318-validated; .320 gated both and left the pre-stamp step-out dead: tether eta=-, zero step_out lines that run)
             local ms = (NPC.GetMoveSpeed and NPC.GetMoveSpeed(State.hero)) or 320
             local walk_s = d0 / math.max(150, ms)
-            -- R1 timing: a raid transits by keen (~channel + a short landing walk), not the full
-            -- d0 walk - stepping out on the walk estimate would land him at the deep stand seconds
-            -- early = waiting in enemy territory, the exact doctrine violation.
+            -- KEEN TRANSIT (not the full d0 walk): a keen approach transits by keen (~channel + a
+            -- short landing walk); pricing it as the walk lands him seconds early, idling at the
+            -- stand (v0.1.320: the fogged near_due idle - the collapse was raid-only, but a
+            -- lane-approach keen [resid=0] is priced the same, matching the keen-calibrated
+            -- scheduler). Keen AND rearm down -> the real walk stands.
             -- v0.1.211: ladder-aware (keen down + rearm ready = rearm channel + keen channel).
-            if raidok then
-                local tr = ready(State.keen) and (K.KEEN_CHANNEL + 1.0)
-                           or (ready(State.rearm) and rearm_channel() + K.KEEN_CHANNEL + 1.0 or nil)
-                if tr then walk_s = math.min(walk_s, tr) end
-            end
+            local tr = ready(State.keen) and (K.KEEN_CHANNEL + 1.0)
+                       or (ready(State.rearm) and rearm_channel() + K.KEEN_CHANNEL + 1.0 or nil)
+            if tr then walk_s = math.min(walk_s, tr) end
             if d0 <= K.WAVE_ENGAGE_RANGE then
                 s.steppedOut = true                        -- committed already near the stand: no tether leg
-            elseif eta_live and now() >= eta_live - walk_s - K.STEP_OUT_LEAD then
+            elseif eta_live and now() >= eta_live - walk_s - K.STEP_OUT_PRECAST_S then   -- v0.1.322: arrive with the PRE-CAST window in hand, not the engage lead
                 s.steppedOut = true
                 State.keenedSpot = false                   -- v0.1.175: the tether leg may have SPENT the keen reaching the anchor; re-arm the ladder (rearm-reset -> keen) so the step-out leg can RAID (run-13: keenedSpot=true made every deep step-out walk 3000u+)
                 logline(string.format("step_out eta=%.1f walk=%.1f d=%.0f", eta_live, walk_s, d0))
@@ -3925,7 +4237,7 @@ local function fsm_move_wave(s)
                 -- spot for 30s+ (the raid keen transit ~4s pushes step-out to the last seconds).
                 -- Release to the planner with the shove suppressed for the wait; the re-decide
                 -- after suppression re-commits the shove in time to step out.
-                local wait_s = eta_live and (eta_live - now() - walk_s - K.STEP_OUT_LEAD) or nil
+                local wait_s = eta_live and (eta_live - now() - walk_s - K.STEP_OUT_PRECAST_S) or nil   -- v0.1.322: same window as the threshold (tether-release economics consistent)
                 if wait_s and wait_s > K.TETHER_MAX_HOLD_S and now() >= (State.releaseBlockUntil or 0) then
                     suppress_shove(s.lane, now() + math.min(wait_s - 2, 25))
                     State.releaseSuppress[s.lane or K.HOME_LANE] = State.shoveSuppress[s.lane or K.HOME_LANE]   -- v0.1.252: mark as release-created (cancellable)
@@ -3935,7 +4247,17 @@ local function fsm_move_wave(s)
                 end
                 -- (review v0.1.178: tether spot cached per commit, same as the live branch)
                 if not s.tetherSpot then
-                    s.tetherSpot = protected_wait_spot({ x = s.standSpot.stand.x, y = s.standSpot.stand.y })
+                    -- v0.1.305 (user, run-110 "fixed under the tower... good option when the
+                    -- enemy has a disable, which is not this case - check the LIVE skills"):
+                    -- the pocket is for DISABLERS. The kit-checked read (channel_threat_near
+                    -- over hero_data x threat_data, fog-aware) decides: disable threat in
+                    -- reach of the stand -> the protected structure pocket; none -> wait AT
+                    -- THE STAND (the preemptive position - lead W1 + consecutive W2 fire on
+                    -- time). The tether release economics are unchanged (long waits still
+                    -- become jungle windows).
+                    s.tetherSpot = channel_threat_near({ x = s.standSpot.stand.x, y = s.standSpot.stand.y })
+                                   and protected_wait_spot({ x = s.standSpot.stand.x, y = s.standSpot.stand.y })
+                                   or { x = s.standSpot.stand.x, y = s.standSpot.stand.y }
                     -- v0.1.206 (user: "if we are raiding, just keen direct on the creep"): the raid
                     -- keen is GLOBAL - transiting to a far hold buys NOTHING, and the v0.1.194 keen
                     -- ladder on far raid legs re-created keen->structure -> rearm -> keen->creep
@@ -3977,6 +4299,64 @@ local function fsm_move_wave(s)
                 return
             end
         end
+        -- v0.1.283 THE 950-BOUNDARY OSCILLATOR, the real frenetic-flap root (runs 84-91,
+        -- survived .275 AND .276 because both guarded the wrong doors): the protected hold
+        -- sits ~1300 from the stand = OUTSIDE the d0<=950 at-stand gate below. Choosing it
+        -- walked him back across the boundary, the APPROACH branch took over and walked him
+        -- forward, across, prot hold again - a two-section oscillator inside ONE commit
+        -- (run-91 t~175: flap until the stuck watchdog killed the commit at d=954). FIX:
+        -- the protection latch is evaluated FIRST and OWNS the tick - while latched, hold
+        -- at the protected spot (tight eps) and never fall through to the approach; the W2
+        -- prearm runs here too (the pocket IS the safety posture - the run-91 5:30 W1-then-
+        -- tower-walk now rearms AT the pocket, W2 ready on return). Prot clears after
+        -- PROT_CLEAR_S clean -> normal approach resumes.
+        if channel_threat_near({ x = s.standSpot.stand.x, y = s.standSpot.stand.y }) then   -- v0.1.305 (user): the protection latch is KIT-CHECKED - only a live disable threat pockets the wait; a no-disable laner leaves the preemptive stand alone
+            s.protUntil = now() + K.PROT_CLEAR_S
+        end
+        if s.protUntil and now() < s.protUntil then
+            local w = protected_wait_spot({ x = s.standSpot.stand.x, y = s.standSpot.stand.y })
+            local hv = Vector(w.x, w.y, me0.z)
+            State.waitInfo = { why = string.format("wave %ds @tower", math.max(0, math.floor((s.waveEta or now()) - now()))), t = now() }
+            if (State.marchCasts or 0) == 1 and not State.marchPending and not ready(State.march)
+               and me0:Distance(hv) <= K.WAVE_HOLD_EPS
+               and effective_mana() >= abil_mana(State.rearm, K.REARM_MANA_FB) + abil_mana(State.march, K.MARCH_MANA_FB)
+               and safe_rearm() then
+                logline("prearm_w2"); return
+            end
+            -- v0.1.285 (run-93): ARM 2 FROM THE POCKET - W2 is prearmed; fire it on the
+            -- cadence lead from here, up-lane, so the stream meets the wave BEFORE the
+            -- tower (waiting for the arrival gate meant W2 under the tower, tower CS).
+            if (State.marchCasts or 0) == 1 and not State.marchPending and ready(State.march)
+               and effective_mana() >= abil_mana(State.march, K.MARCH_MANA_FB) then
+                -- v0.1.306 THE CONSECUTIVE W2 reaches the POCKET (run-111 t~504: the fog W1's
+                -- W2 waited for the NEXT cadence window ~25s out = "one preemptive W, returned
+                -- to tower, then cast 2"): W2 follows the rearm while the committed wave is
+                -- still current - the cadence-lead gate times W1, never W2 (.304 principle).
+                -- v0.1.314 (bug hunt D13): carry the same near-bound + drift the at-stand fog
+                -- W2 got in .306/.309 - a rolled s.waveEta could fire the POCKET W2 a full
+                -- cadence early (teta ~30) against a wave 30s out; the guard only landed on the
+                -- at-stand twin, not here.
+                local w2drift = (State.etaDrift and State.etaDrift[s.lane or K.HOME_LANE]) or 0
+                if s.waveEta and (s.waveEta - now()) <= 8 and now() <= s.waveEta + w2drift + K.WAVE_WAIT_GRACE then
+                    local fp2 = friendly_fountain_pos()
+                    local aim2 = s.standSpot.aim
+                    if fp2 then
+                        local ux, uy = s.standSpot.stand.x - fp2.x, s.standSpot.stand.y - fp2.y
+                        local ul = math.sqrt(ux * ux + uy * uy)
+                        if ul > 1 then aim2 = Vector(s.standSpot.stand.x + ux / ul * 700, s.standSpot.stand.y + uy / ul * 700, me0.z) end
+                    end
+                    local cp2, th2 = march_cross_target(me0, aim2)
+                    if cast_pos(State.march, cp2) then
+                        State.marchPending = { cdBefore = cd_remaining(State.march), expire = now() + 1.5 }
+                        State.wArm = (State.wArm == 2) and 1 or 2
+                        logline(string.format("march_aim src=shove_w2 fog=y pat=x%d lane=%s cast=(%.0f,%.0f) aim=(%.0f,%.0f) pocket=y",
+                            th2, tostring(s.lane), cp2.x, cp2.y, aim2.x, aim2.y))
+                    end
+                end
+            end
+            if me0:Distance(hv) > K.WAVE_HOLD_EPS then lane_go(hv, raidok) end
+            return
+        end
         if d0 > K.WAVE_ENGAGE_RANGE then
             if no_progress(d0) then                    -- Note 1: keen landed where the stand is unreachable (tower high ground) -> recover, and suppress re-shoving the same spot
                 suppress_shove(s.lane, now() + K.SHOVE_STUCK_S)
@@ -3985,15 +4365,69 @@ local function fsm_move_wave(s)
             end
             lane_go(s.standSpot.stand, raidok); return -- Piece 0: clamp + keen/rearm/blink/walk ladder (+ creep anchors on a raid)
         end
-        -- at the stand, waiting for the wave to close (post step-out this window is ~STEP_OUT_LEAD).
-        -- note 3 (v0.1.160, user): an enemy hero on the lane harasses a forward wait - hold the
-        -- fogged wait NEAR OUR TOWER instead; the wave's arrival (live creeps) switches to the
-        -- live branch, which re-approaches the stand as normal.
+        -- at the stand, waiting for the wave to close (post step-out this window is ~STEP_OUT_PRECAST_S
+        -- since v0.1.322 - the PRE-CAST window: shove_pre fires W1 here on the W-GEOM-3 lead).
+        -- note 3 (v0.1.160, user): an enemy hero on the lane harasses a forward wait - the
+        -- protected hold above owns that case now (v0.1.283); from here down the wait is
+        -- UNPROTECTED (no enemy near) at the stand ring.
         local hold = s.standSpot.stand
-        local prot = enemy_hero_near({ x = hold.x, y = hold.y }, K.WAIT_ENEMY_R)
-        if prot then
-            local w = protected_wait_spot({ x = hold.x, y = hold.y })
-            hold = Vector(w.x, w.y, me0.z)
+        local prot = false
+        -- v0.1.278 W-GEOM-3b THE FOG PREEMPT (user-approved upgrade to the .277 lead cast):
+        -- the visible-only preempt loses its window when vision is short (night, uphill,
+        -- trees - the wave can enter sight inside the 950 arrival trigger). When the
+        -- STAMPED per-lane cadence (the measured rhythm; NEVER the mirror estimate, the
+        -- .160 liar) puts the next arrival within W_LEAD_S and the wait is UNCONTESTED
+        -- (no protection latch = no enemy near to hold the wave), fire arm 1 into the fog
+        -- along the frozen aim: the stream meets the wave as it walks into vision, and the
+        -- live branch's arrival flow (rearm + arm 2) takes over unchanged. Whiff cost on a
+        -- frozen lane = one W; the phantom/overdue machinery owns the no-show redecide
+        -- (which now also clears the pending stamp so the next engage cannot inherit it).
+        -- v0.1.279 (run-87 user sighting "casted in the wrong place or too early", both
+        -- confirmed in the placements): (a) AT-STAND GATE - the .278 fog cast could fire
+        -- up to 950 from the stand (straight off the keen landing, cast B at ~1000+ from
+        -- the meet); same gate as the live preempt now. (b) UP-LANE AIM - the frozen
+        -- standSpot.aim is the MEET point, at/near the stand, so the cross arms rotated
+        -- around a degenerate axis and the stream direction came out arbitrary; the fog
+        -- cast now aims up-lane (away from our fountain through the stand), the direction
+        -- the wave actually comes from. (c) OWN LEAD - arrival stamps read +1..+5s LATE vs
+        -- the cadence eta (run-87 eta_err), stretching the effective lead past the sweep's
+        -- saturation; the fog lead is its own smaller knob.
+        if (State.marchCasts or 0) <= 1 and not State.marchPending and ready(State.march)
+           and not prot and State.laneWaveT[s.lane or K.HOME_LANE]
+           and me0:Distance(s.standSpot.stand) <= K.W_PRE_STAND_R
+           and effective_mana() >= abil_mana(State.march, K.MARCH_MANA_FB) + ((State.marchCasts or 0) == 0 and abil_mana(State.rearm, K.REARM_MANA_FB) or 0) then
+            local nxt = Schedule.NextWaveArrival(now(), K.WAVE_PERIOD, K.WAVE_PHASE, State.laneWaveT[s.lane or K.HOME_LANE])
+            local lead = nxt and (nxt - now())
+            -- v0.1.306: the cadence-lead window times W1 ONLY; W2 is CONSECUTIVE (the .304
+            -- principle in the fogged branch) - after a fog W1 the wave is ~3.5s out, the
+            -- rearm takes ~3s, so W2 at rearm-done lands right on it. Waiting for the next
+            -- window orphaned fog engages (run-111 t~504) and stretched W2 gaps to 5.7-6.3s.
+            local w2turn = (State.marchCasts or 0) == 1
+            -- v0.1.309: the fog clock is DRIFT-CORRECTED (.293 re-applied; arrivals ran +3..+10
+            -- late = fog W1s early); the fog W2 additionally requires the wave NEAR on its own
+            -- eta (run-113: a rolled s.waveEta let a fog W2 fire at teta=29.7 = wasted robots).
+            local drift = (State.etaDrift and State.etaDrift[s.lane or K.HOME_LANE]) or 0
+            if (w2turn and s.waveEta and (s.waveEta - now()) <= 8
+                and now() <= s.waveEta + drift + K.WAVE_WAIT_GRACE)
+               or (not w2turn and lead and (lead + drift) > 0 and (lead + drift) <= K.W_LEAD_FOG_S) then
+                local fogAim = s.standSpot.aim
+                local fp = friendly_fountain_pos()
+                if fp then
+                    local ux, uy = s.standSpot.stand.x - fp.x, s.standSpot.stand.y - fp.y
+                    local ul = math.sqrt(ux * ux + uy * uy)
+                    if ul > 1 then
+                        fogAim = Vector(s.standSpot.stand.x + ux / ul * 700,
+                                        s.standSpot.stand.y + uy / ul * 700, me0.z)
+                    end
+                end
+                local cp, theta = march_cross_target(me0, fogAim)
+                if cast_pos(State.march, cp) then
+                    State.marchPending = { cdBefore = cd_remaining(State.march), expire = now() + 1.5 }
+                    State.wArm = (State.wArm == 2) and 1 or 2
+                    logline(string.format("march_aim src=%s fog=y pat=x%d lane=%s teta=%.1f cast=(%.0f,%.0f) aim=(%.0f,%.0f)",
+                        w2turn and "shove_w2" or "shove_pre", theta, tostring(s.lane), lead or -1, cp.x, cp.y, fogAim.x, fogAim.y))
+                end
+            end
         end
         -- v0.1.163 (user): this IS a deliberate wait - say so (HUD reads WAIT, not MOVE).
         State.waitInfo = { why = string.format("wave %ds%s", math.max(0, math.floor((s.waveEta or now()) - now())),
@@ -4003,7 +4437,10 @@ local function fsm_move_wave(s)
         -- stand on a raid commit, but this caller DROPPED the raid flag - a legally-deep
         -- drifted hold hit the non-raid tripwire (deep_reject "UPSTREAM BUG", the one false
         -- positive). Pass raidok like the approach leg above; the tripwire label is honest again.
-        if me0:Distance(hold) > K.WAVE_HOLD_EPS then lane_go(hold, raidok) end
+        -- v0.1.282: the STAND hold truncates at W_PRE_STAND_R (the box covers the gap and
+        -- the wave walks in - no forward positioning theater); the PROTECTED hold keeps
+        -- the tight eps (it is a small safe pocket, being IN it is the point).
+        if me0:Distance(hold) > (prot and K.WAVE_HOLD_EPS or K.W_PRE_STAND_R) then lane_go(hold, raidok) end
         return
     end
     local me = origin(State.hero)
@@ -4019,9 +4456,26 @@ local function fsm_move_wave(s)
         if not s.ncT then s.ncT, s.ncD = now(), dWave
         elseif dWave < s.ncD - K.NC_CLOSE_EPS then s.ncT, s.ncD = now(), dWave   -- closing: re-arm the grace
         elseif now() - s.ncT > K.NC_GRACE_S then
-            suppress_shove(s.lane, now() + K.SHOVE_STUCK_S)
-            State.spot = nil; State.fsm = "DECIDE"; State.moveSince = nil
-            logline("wave_move abort reason=nocover"); return
+            -- CASE-FILE 3 (v0.1.274, run-83, user go): a NEAR, HELD (not receding), FUNDABLE
+            -- wave keeps the frozen legal stand instead of bailing - the old unconditional
+            -- bail fed the Plan's recover<->resume flap (two tower round trips, 15s of
+            -- pick=none) while the wave arrived anyway. Falling through keeps the engage
+            -- triggers, the live tether, and the MOVE_TIMEOUT guillotine live, so the hold
+            -- is bounded (25s + wave-eta grace). Receding, FAR, or unfundable waves bail
+            -- exactly as before (Plan jungles the window) - the run-23/25 classes stay cured.
+            local receding = dWave > (s.ncD or dWave) + K.NC_CLOSE_EPS
+            local fundable = effective_mana() >= abil_mana(State.march, K.MARCH_MANA_FB)
+                                                 + abil_mana(State.rearm, K.REARM_MANA_FB)
+            if receding or dWave > K.NC_HOLD_NEAR or not fundable then
+                suppress_shove(s.lane, now() + K.SHOVE_STUCK_S)
+                State.spot = nil; State.fsm = "DECIDE"; State.moveSince = nil
+                logline("wave_move abort reason=nocover"); return
+            end
+            if not s.ncHeld then
+                s.ncHeld = true
+                logline(string.format("nocover_hold dWave=%.0f", dWave))
+            end
+            State.waitInfo = { why = "nocover hold", t = now() }
         end
     else
         s.ncT, s.ncD = nil, nil
@@ -4038,20 +4492,141 @@ local function fsm_move_wave(s)
     -- fell ~900 short -> the ranged miss. OFF: the baseline centroid trig. Both use WAVE_ENGAGE_RANGE.
     local eref = s.standSpot.aim                            -- T0 collapsed: engage measures to the AIM (the trailing ranged)
     local dref = me:Distance(eref)
+    -- W-GEOM-3 THE PREEMPTIVE LEAD CAST (v0.1.277; user design - the prediction owns the
+    -- timing - + the lib/march_sim lead sweep, study sec 9: below lead ~4s every second of
+    -- fire lead saves ~1s of engage; saturation 4.5-5.5s; the old at-arrival fire cleared
+    -- +7s AFTER the wave reached the stand). With Tinker AT the stand and the wave CLOSING
+    -- (commit-local EMA), fire the FIRST W when the wave is W_LEAD_S out: the robot stream
+    -- and the wave MEET at the stand instead of the robots starting when the wave is
+    -- already here. Supersedes the W_FRONT_MAX edge hold (the instant-AOE compensation,
+    -- deleted from the engage) and realizes the v0.1.121 deferred design: a stand-still
+    -- cast that never touches the FSM = the chase loop cannot form by construction. The
+    -- ENGAGE (arrival trigger below, unchanged) then rearms and fires arm 2 as the wave
+    -- lands - the W->rearm->W cycle overlaps the approach instead of following it.
+    -- v0.1.280 (run-88 "terrible W casts": close read 627 and 1688 - the hero's OWN
+    -- approach speed polluted the rate, dref shrinks from both motions): the EMA history
+    -- RESETS whenever the hero moved this tick, so it only accumulates while standing -
+    -- a clean wave-only closure, warm ~2 ticks after arrival.
+    if s.wgHx and (math.abs(me.x - s.wgHx) + math.abs(me.y - s.wgHy)) > 30 then
+        s.wgD, s.wgClose, s.wgN = nil, nil, nil
+    end
+    s.wgHx, s.wgHy = me.x, me.y
+    if s.wgD and s.wgT and now() > s.wgT then               -- closing EMA (stationary ticks only)
+        local rate = (s.wgD - dref) / (now() - s.wgT)
+        -- v0.1.281 (run-89: close=627 SURVIVED the stationary fix, repeatably): the AIM
+        -- ANCHOR jumps a creep-spacing forward when a trailing creep dies - a ~600 u/s
+        -- spike that is re-anchoring, not motion. Samples beyond physical closure are
+        -- rejected (the EMA keeps its last honest value).
+        if math.abs(rate) <= 450 then
+            s.wgClose = s.wgClose and (s.wgClose * 0.6 + rate * 0.4) or rate
+            s.wgN = (s.wgN or 0) + 1   -- v0.1.309: warm-EMA counter (reset with the history on self-motion)
+        end
+    end
+    s.wgD, s.wgT = dref, now()
+    -- v0.1.304 THE CONSECUTIVE W2 (user design, run-109: the arm-2-waits-for-arrival flow
+    -- chased the receding live stand under the tower - the .292 class on the .286 base):
+    -- W1 is PREDICTIVE, so W2 simply follows the rearm - "even if W1 is a bit early, W2
+    -- will for sure hit since it is after". No closing gate, no reach gate, no stand gate:
+    -- fire the other cross arm at the live ranged the moment March is back. The budget
+    -- exit then banks the wave and the planner keens him away (nothing left to wait for,
+    -- nothing to chase; the receding-wave trap cannot form at casts>=1 by construction).
+    if (State.marchCasts or 0) == 1 and not State.marchPending and ready(State.march)
+       and effective_mana() >= abil_mana(State.march, K.MARCH_MANA_FB) then
+        -- v0.1.307 W2 DELIVERY DISCIPLINE (run-112 vs Lina: shove_w2 fired at dref 1333-1374,
+        -- ~500 past the 45-deg arm's true reach = the ranged survived; user: "the anchor
+        -- should be the ranged creep"): W2 fires only within real coverage of the aim; when
+        -- beyond it after a rearm step-back, WALK BACK IN with W2 in hand (the user's dance:
+        -- position - W1 - step back - rearm - back in position - recast; delivery, not a
+        -- chase - the approach block below allows post-cast movement exactly for this).
+        if dref <= K.MARCH_REACH then
+            local cp, theta = march_cross_target(me, eref)
+            if cast_pos(State.march, cp) then
+                State.marchPending = { cdBefore = cd_remaining(State.march), expire = now() + 1.5 }
+                State.wArm = (State.wArm == 2) and 1 or 2
+                logline(string.format("march_aim src=shove_w2 pat=x%d lane=%s cast=(%.0f,%.0f) dref=%.0f",
+                    theta, tostring(s.lane), cp.x, cp.y, dref))
+            end
+        end
+    end
+    -- v0.1.280 rider (run-88: a W preempted onto a creeps=1 straggler): the wave must
+    -- still be WORTH a lead cast at fire time - stragglers get the normal arrival flow.
+    -- (v0.1.304: this block is the W1 LEAD only now - W2 is the consecutive cast above.)
+    if (State.marchCasts or 0) == 0 and not State.marchPending and ready(State.march)
+       and live.n >= K.W_PRE_MIN_N
+       and dref > K.WAVE_ENGAGE_RANGE and dref <= K.W_LEAD_CAP
+       and (s.wgClose or 0) >= K.W_CLOSING_MIN and (s.wgN or 0) >= 2   -- v0.1.309 (run-113 2:30, W1 "100% off" on a non-moving wave): ONE post-reset EMA sample read 305 on a held wave (anchor-jump noise); the lead needs a WARM read
+       and me:Distance(s.standSpot.stand) <= K.W_PRE_STAND_R
+       and effective_mana() >= abil_mana(State.march, K.MARCH_MANA_FB) + abil_mana(State.rearm, K.REARM_MANA_FB) then
+        local tarr = dref / s.wgClose
+        if tarr <= K.W_LEAD_S then
+            local cp, theta = march_cross_target(me, eref)
+            if cast_pos(State.march, cp) then
+                State.marchPending = { cdBefore = cd_remaining(State.march), expire = now() + 1.5 }
+                State.wArm = (State.wArm == 2) and 1 or 2
+                logline(string.format("march_aim src=shove_pre pat=x%d lane=%s tarr=%.1f close=%.0f cast=(%.0f,%.0f) dWave=%.0f",
+                    theta, tostring(s.lane), tarr, s.wgClose, cp.x, cp.y, dWave))
+            end
+        end
+    end
     -- Piece 2 TIME-SCHEDULED first W: also engage when the wave is DUE (waveEta) and Tinker is holding
     -- at the frozen stand with the live wave already inside March's reach. Strictly EARLIER than the
     -- distance trigger and whiff/chase-safe by construction: dWave <= MARCH_REACH (1150) sits under
     -- fsm_engage_wave's reposition bound (WAVE_ENGAGE_RANGE + 250 = 1200), and the clamped cast
     -- (~280 ahead + ~900 sweep) covers the wave from here. The distance trigger stays as base/fallback.
     -- (The spec's ENGAGE_LEAD is already realized by SCHED_LEAD - the scheduler leaves early; no new const.)
+    -- v0.1.284 (run-92: trig=time fired at eta_err +27.5 - the >= condition is a LATCH
+    -- that stays true forever once the eta passes; a stale committed eta then "arrives"
+    -- any live wave instantly): the timed trigger is a WINDOW around the eta, not a
+    -- latch. Past the window the distance trigger owns arrival honestly.
     local timed = s.waveEta and now() >= s.waveEta - K.MARCH_CAST_DUR
-                  and me:Distance(s.standSpot.stand) <= K.ARRIVE_DIST + 180
+                  and now() <= s.waveEta + 2.0
+                  and me:Distance(s.standSpot.stand) <= K.W_PRE_STAND_R
                   and dWave <= K.MARCH_REACH
     if dref <= K.WAVE_ENGAGE_RANGE or timed then
         State.fsm = "ENGAGE"; State.moveSince = nil; State.emptySince = nil
+        -- v0.1.303 LANE-CLOCK D-B: the ARRIVAL is the observation - stamp the cadence clock AND
+        -- the arrival GROUND here, not only at the 2 lucky exits (budget/wave_clear). One
+        -- imperfect wave used to regress the next decide to kinest geometry (run-107 t=95->126).
+        local ln = s.lane or K.HOME_LANE
+        State.laneWaveT[ln] = now()
+        State.laneMeet[ln] = { x = eref.x, y = eref.y, t = now() }
+        -- v0.1.309 re-applied .293 (ledger; run-113 evidence: eta_err +3..+10 all game -> fog
+        -- W1s fired early and the whole chain read "W2 late"): stamp the per-lane arrival
+        -- DRIFT (EMA, clamped 0..6) so the fog casts fire on the CORRECTED clock.
+        if s.waveEta then
+            local drift = math.max(0, math.min(6, now() - s.waveEta))
+            State.etaDrift = State.etaDrift or {}
+            State.etaDrift[ln] = State.etaDrift[ln] and (State.etaDrift[ln] * 0.5 + drift * 0.5) or drift
+        end
         logline(string.format("wave_engage_arrived dWave=%.0f dref=%.0f creeps=%d trig=%s eta_err=%s",
             dWave, dref, live.n, timed and "time" or "dist",
             s.waveEta and string.format("%+.1f", now() - s.waveEta) or "-")); return
+    end
+    -- v0.1.330 THE STALLED-LIVE RELEASE (user un-parked g328 item 1: 124+51+47s = 222s of
+    -- statues): [committed + at/near the stand + wave LIVE but beyond engage range + NOT
+    -- closing] had no exit - the arrival trigger needs dref<=950, the phantom-bail needs
+    -- INVISIBLE, the tether release is pre-step-out only, and MOVE_TIMEOUT below is refreshed
+    -- by the ENGAGE->MOVE reposition flip (:4949) so it never ages during the ping-pong (g328
+    -- t=521: timed-engage fired W1, reposition bounced back, W2 went out consecutive, then the
+    -- SPENT commit sat 124s with the wave stalled at ~1200+). This exit consults REALITY only
+    -- (the .325 lesson): live wave, far, closure EMA dead or unwarmed for LIVE_STALL_S straight
+    -- -> release the window (suppress LIVE_STALL_S so the lane re-competes when the stalemate
+    -- resolves). Closing or near resets the clock: a normally-walking wave can never trip this
+    -- (EMA warms in ~2 stationary ticks and reads 300+; the post-step-out self-motion transient
+    -- is ~2-6s << 15). s.stallT lives on the commit and survives the ENGAGE<->MOVE flips.
+    if dref > K.WAVE_ENGAGE_RANGE and ((s.wgClose or 0) < K.W_CLOSING_MIN or (s.wgN or 0) < 2) then
+        s.stallT = s.stallT or now()
+        if now() - s.stallT > K.LIVE_STALL_S then
+            logline(string.format("stall_release lane=%s dref=%.0f close=%s casts=%d held=%.1f",
+                tostring(s.lane or K.HOME_LANE), dref, tostring(s.wgClose), State.marchCasts or 0,
+                now() - s.stallT))
+            if s.shove then suppress_shove(s.lane, now() + K.LIVE_STALL_S) end
+            State.spot = nil; State.fsm = "DECIDE"; State.moveSince = nil
+            State.marchPending = nil
+            return
+        end
+    else
+        s.stallT = nil
     end
     if State.moveSince and now() - State.moveSince > K.MOVE_TIMEOUT then
         -- v0.1.194 F3 (run-24 t=707/769): a tether with a CONCRETE step-out shortly ahead is not
@@ -4115,7 +4690,9 @@ local function fsm_move_wave(s)
             -- far stalemate creep fight held close_s high FOREVER, and refreshing moveSince made
             -- the tether an idle trap; after 25s the redecide re-plans the window (maybe a camp).)
             if not s.tetherSpot then
-                s.tetherSpot = protected_wait_spot({ x = s.standSpot.stand.x, y = s.standSpot.stand.y })
+                s.tetherSpot = channel_threat_near({ x = s.standSpot.stand.x, y = s.standSpot.stand.y })
+                               and protected_wait_spot({ x = s.standSpot.stand.x, y = s.standSpot.stand.y })
+                               or { x = s.standSpot.stand.x, y = s.standSpot.stand.y }   -- v0.1.305: kit-checked pocket, same as the fogged twin (no disabler = wait at the preemptive stand)
                 -- v0.1.207 (run-32 t=828: the keen->structure->rearm->keen->creep chain SURVIVED
                 -- v0.1.206 because only the FOGGED tether was fixed - this LIVE tether is its twin
                 -- and kept the v0.1.194 far-leg keen ladder): same cure - the raid keen is GLOBAL,
@@ -4158,7 +4735,61 @@ local function fsm_move_wave(s)
     -- Piece 0: clamp + ladder own the whole leg. HOLD-STILL (v0.1.153): once AT the stand
     -- (watching the wave close), issue NO more movement - re-ordering move_to every tick
     -- twitched Tinker in place (move, cancel, move).
-    if me:Distance(s.standSpot.stand) > K.WAVE_HOLD_EPS then
+    -- v0.1.282 (run-90 user): the approach stops W_PRE_STAND_R short of the stand - the
+    -- box covers the gap, the wave walks in, the preempt/timed gates accept it; walking
+    -- the last 600 was positioning theater and delayed the EMA (which needs stillness).
+    -- v0.1.304 THE POST-CAST FREEZE (the .292 fix re-applied per the ledger - its evidence
+    -- arrived in run-109: after W1 our robots push their wave back, the live-tracked stand
+    -- ADVANCES, and the approach chased it under the tower for W2): once this wave's first
+    -- cast is spent, the approach never advances - the consecutive W2 above fires from
+    -- here, and the fight comes back through the corridor. MOVE_TIMEOUT bounds the hold.
+    -- v0.1.305 re-applied .295/.301 (the held-wave walk-in): the .282 stop-short premise is
+    -- a CLOSING wave; a wave HELD in a fight (decide stamp or the warm EMA's held band)
+    -- never walks the last 600 in, parking dref outside every trigger - walk to the exact
+    -- stand instead (dref = 810 by construction = arrival fires). Held BAND only: receding
+    -- waves are the .304 consecutive-W2's business, not a chase.
+    if not s.walkIn and dref > K.WAVE_ENGAGE_RANGE
+       and ((s.waveAsrc == "held")
+            or ((s.wgClose or math.huge) < K.W_CLOSING_MIN
+                and (s.wgClose or -math.huge) > -K.W_CLOSING_MIN))
+       and enemy_tower_risk(s.standSpot.aim) <= 0 then   -- v0.1.309 (run-113 "stepped inside the tower": the walk-in to the exact stand of a tower-pushed wave lands at the ~850 legal edge): tower-adjacent aims keep the 600-park; the corridor + step-in (tower-gated) cover from range
+        s.walkIn = true
+        logline(string.format("wave_walkin dref=%.0f asrc=%s close=%s", dref, tostring(s.waveAsrc),
+            s.wgClose and string.format("%.0f", s.wgClose) or "-"))
+    end
+    -- v0.1.307 THE REARM DANCE, MOVE side (user design vs disablers: "go to the correct
+    -- position, cast W1, go a little back, rearm, go back in position and recast"): with W1
+    -- spent and March down, a channel-gated rearm (disabler in reach - Lina LSA class) steps
+    -- BACK toward the protected spot and retries every tick; the prearm fires the moment the
+    -- gate clears. With W2 IN HAND and the aim beyond coverage, walk BACK IN (delivery - the
+    -- .292 freeze stays for the waiting case only: never advance while NOT ready).
+    if (State.marchCasts or 0) >= 1 and not State.marchPending then
+        if not ready(State.march) then
+            local thr, tpos = channel_threat_near(origin(State.hero))
+            if thr and tpos
+               and effective_mana() >= abil_mana(State.rearm, K.REARM_MANA_FB) + abil_mana(State.march, K.MARCH_MANA_FB) then
+                -- v0.1.308 (user): NOT the protected spot - just OUT OF RANGE, minimally.
+                -- One short step per tick straight away from the gating threat; the prearm
+                -- retries every tick and the rearm fires the moment the gate clears. If she
+                -- follows to keep the gate on us, she walks into W1's robot corridor.
+                local dx, dy = me.x - tpos.x, me.y - tpos.y
+                local dl = math.sqrt(dx * dx + dy * dy)
+                if dl > 1 then
+                    move_to(Vector(me.x + dx / dl * 300, me.y + dy / dl * 300, me.z), "rearm_stepback")
+                end
+            end
+        elseif dref > K.MARCH_REACH and me:Distance(s.standSpot.stand) > K.WAVE_HOLD_EPS then
+            -- v0.1.315 REVERTED the v0.1.314 A2 depth guard: it blocked W2 delivery whenever the
+            -- hero was parked short of the stand (the .282 stop-short = shallower than the stand),
+            -- which is the NORMAL post-W1 posture, so a held/far wave never got its W2 = "only 1 W
+            -- without waves about to arrive" (run-115). A2's receding-chase concern was speculative
+            -- + bounded by MOVE_TIMEOUT; the delivery walk targets the tower-safe stand (no death).
+            lane_go(s.standSpot.stand, raidok)   -- W2 delivery: back into position, the W2 block fires once inside coverage
+        end
+        return
+    end
+    if (State.marchCasts or 0) == 0 and not State.marchPending
+       and me:Distance(s.standSpot.stand) > (s.walkIn and K.WAVE_HOLD_EPS or K.W_PRE_STAND_R) then
         -- RAID (Phase 2 R1): the LIVE-wave approach is where the run-10 deep walks lived (visible
         -- commits, travel 15-19s, residual 2300+) - at Keen L2 keen onto a creep near the stand.
         lane_go(s.standSpot.stand, raidok)
@@ -4325,6 +4956,28 @@ local function fsm_engage_wave(s)
         if s.shove then suppress_shove(s.lane, now() + K.SHOVE_STUCK_S) end
         go_return(); return
     end
+    -- v0.1.267 STEP-BACK REARM driver (run-78: vs a laning Lina every wave went W1 +
+    -- channel_defer x4s + bail - the gate is right per-channel, but the wave STAND sits
+    -- permanently inside the laner's gate reach, so the .262 bail turned a mana guard into
+    -- a GPM leak; user picked step-back over the alternatives). While armed: hold the
+    -- engage (the reposition flip below must not steal the walk), keep walking OUT of the
+    -- gating enemy's reach, and re-try the rearm each tick - it fires the moment the gate
+    -- clears; the normal reposition then walks back in for W2. Deadline -> the .262 bail.
+    do
+        local sb = State.rearmStepback
+        if sb then
+            if now() > sb.deadline or ready(State.march) then
+                State.rearmStepback = nil
+            elseif safe_rearm() then
+                State.rearmStepback = nil
+                logline("rearm_stepback fired"); return
+            else
+                move_to(sb.spot, "rearm_stepback")
+                State.moveSince = now()                -- intentional walk: feed the watchdogs
+                return
+            end
+        end
+    end
     if me:Distance(s.refPoint) > K.WAVE_ENGAGE_RANGE + 250 then   -- wave drifted out of reach: reposition
         State.fsm = "MOVE"; State.moveSince = now(); State.keenedSpot = false
         logline("wave_engage reposition dWave=" .. math.floor(me:Distance(s.refPoint))); return
@@ -4336,8 +4989,9 @@ local function fsm_engage_wave(s)
     -- channel gate deferred every Rearm next to a PARKED Venge - a hold can never resolve a
     -- parked disabler (the .239 law). Defer persisting with March down = bail + suppress;
     -- the planner farms away from the disabler and the lane re-competes next decide.
+    -- v0.1.267: the step-back gets its try first (not State.rearmStepback).
     if State.chanDeferSince and now() - State.chanDeferSince > K.CHANNEL_DEFER_BAIL_S
-       and not ready(State.march) then
+       and not State.rearmStepback and not ready(State.march) then
         logline("engage_bail reason=channel_defer")
         suppress_shove(State.spot and State.spot.lane, now() + K.SHOVE_STUCK_S)
         State.chanDeferSince = nil
@@ -4381,98 +5035,78 @@ local function fsm_engage_wave(s)
         return
     end
     if ready(State.march) then
-        local aim = s.standSpot.aim
-        local maxr = (K.MARCH_CAST_RANGE or 300) - 20
-        -- THE lane W pattern (v0.1.166 user design; v0.1.173 fixed after the run-11 report "both
-        -- marches in the same direction"): ONE cast builder, two placements, alternating per cast.
-        --   FRONT  (even casts): the box AT the wave - tgt = aim (the span-center/ranged from
-        --     update_wave_spot) +- a perp wiggle whose SIDE alternates across successive front
-        --     casts. Robots spawn on OUR side and sweep INTO the wave's front line.
-        --   BEHIND (odd casts): tgt = W_BEHIND_BACKSTEP BEHIND the hero (opposite the wave) -
-        --     the facing FLIPS, so the robots spawn at the box's far edge (beyond the wave) and
-        --     sweep BACK through it: the enemy REAR (the ranged) eats them first. (v0.1.166-172
-        --     targeted aim+350 PAST the wave, but the cast-range clamp collapsed that onto the
-        --     same forward ray as the front cast = two identical casts, the run-11 sighting.)
-        --     Only when the spawn edge clears the wave (dref + CREEP_DISC <= 900 - backstep),
-        --     else this cast falls back to the front placement.
-        local ldir = Lane.PathTangent((lane_paths() or {})[s.lane or K.HOME_LANE], { x = aim.x, y = aim.y })
-                     or lane_push_dirs()                         -- fallback: enemy creeps' travel dir
-        -- v0.1.176 (run-14 census: 20 front / 2 behind, "some casts still only forward"): the
-        -- alternation is a GLOBAL latch now (State.wantBehind), not marchCasts parity - the parity
-        -- reset to FRONT on every commit (the far timed cast + the near re-commit = two fronts in a
-        -- row every wave), and an ineligible behind LOST its turn. Now: an ineligible behind casts
-        -- front but KEEPS wanting behind, so the rear sweep fires on the first eligible cast.
-        local behind = State.wantBehind and true or false
-        if behind and me:Distance(aim) + K.W_BEHIND_CLEAR > K.MARCH_LEN / 2 - K.W_BEHIND_BACKSTEP then
-            -- v0.1.195 (user, run-25: "at center meetings ALL W cast front" - 30F/5B): from the
-            -- 850-forward stand the rear sweep is GEOMETRICALLY impossible (spawn edge = me +
-            -- 900 - backstep ~ 840 < aim ~850+), and a wave HELD at the meeting never closes,
-            -- so the wantBehind latch starved. A due-but-ineligible behind now STEPS IN to the
-            -- eligibility edge and casts from there next tick, instead of burning the turn on
-            -- another front. Bounded: near shortfall only (aim <= STEPIN_MAX), safe point only,
-            -- single-direction nudge inside ENGAGE - the v0.1.119 chase loop cannot re-form.
-            local dref0 = me:Distance(aim)
-            local stepped = false
-            if dref0 <= K.W_BEHIND_STEPIN_MAX then
-                local need = dref0 - (K.MARCH_LEN / 2 - K.W_BEHIND_BACKSTEP - K.W_BEHIND_CLEAR) + 40
-                local dxs, dys = aim.x - me.x, aim.y - me.y
-                local dls = math.sqrt(dxs * dxs + dys * dys)
-                if dls > 1 and need > 0 then
-                    local sp = { x = me.x + dxs / dls * need, y = me.y + dys / dls * need }
-                    -- v0.1.198 audit HOLE A: the step-in obeys the walk law like every other
-                    -- lane destination - a deep aim must never nudge him past the line.
-                    local dok2 = s.shove and ((State.keen and Ability.GetLevel and Ability.GetLevel(State.keen)) or 0) >= 2
-                    if not lane_unsafe(sp) and (dok2 or (stand_depth(sp) <= K.WALK_DEPTH_MAX and lane_leash_ok(sp))) then   -- v0.1.202: dok2 (raid-capable shove) exempts the leash for the in-engage nudge too
-                        move_to(Vector(sp.x, sp.y, me.z), "stepin_w")
-                        State.waitInfo = { why = "step-in W", t = now() }
-                        stepped = true
+        -- THE lane W pattern, W-GEOM-2 (v0.1.270/.271, user design, study sec 8): THE CROSS -
+        -- ONE builder (march_cross_target), two arms 90 deg apart rotated 45 off the
+        -- hero->aim axis, alternating per cast via the State.wArm global latch (flips only
+        -- on success, the v0.1.176 lesson). The crossed arms see DIFFERENT projections of
+        -- the wave, so the melee screen cannot shadow the trailing ranged in both casts,
+        -- and there is no rear-sweep eligibility hole. Camps unchanged.
+        -- W-GEOM-3 (v0.1.277): the v0.1.221 W_FRONT_MAX edge hold is DELETED - it was the
+        -- instant-AOE model's compensation (fire late so the box lands on the wave). The
+        -- wavefront model owns timing now: the FIRST W fires preemptively from MOVE at
+        -- W_LEAD_S (see fsm_move_wave); by the time the engage casts, the wave is at most
+        -- ~950 out and closing = robots meet it mid-corridor (sim-validated at far longer
+        -- leads than this).
+        -- v0.1.281 (run-89 t~2:20, user: "cast the second W under the tower and
+        -- teleported"): THE ARRIVAL GATE - the engage's cast waits for the wave to
+        -- actually arrive (dref <= WAVE_ENGAGE_RANGE) and be worth it (2+ creeps; a lone
+        -- straggler dies to the allied wave, wave_clear exits at casts=0). All early
+        -- casting belongs to the MOVE preempt.
+        -- v0.1.284 (run-92: BOTH arms fired with the wave 1100-1400 out): the .281 arm-2+
+        -- exemption ("the wave is on us by then") went false the moment prearm_w2 made W
+        -- ready BEFORE arrival; combined with the stale-eta timed latch, arm 2 fired the
+        -- tick the engage entered. The gate applies to EVERY cast now - arm 2 waits for
+        -- the wave exactly like arm 1 (the user rule: "when the wave is visible cast the
+        -- next W" - visible AND arrived).
+        do
+            local dref0 = me:Distance(s.standSpot.aim)
+            -- v0.1.286 (run-94 4:30, user: "casted W too far and didn't hit the ranged
+            -- creep"): the 45-deg arm reaches (280+900)*cos45 ~ 834 along the aim axis,
+            -- but the gate allowed casts at dref up to 950 - the trailing ranged sat
+            -- ~100 outside the corridor. The ARRIVAL cast waits to the arm's true reach
+            -- (the old W_FRONT_MAX 800 was right for arrival casts all along); lead
+            -- casts are unaffected (their waves walk in).
+            -- v0.1.305 (user, run-110 t=349: a locked even/hold fight sat 46s in this W-wait;
+            -- the ledger's held-wave unit [.291+.295+.298+.288] re-applied, unified with the
+            -- .304 consecutive-W2 principle): the reach gate applies to the FIRST cast ONLY -
+            -- W2+ follows the rearm unconditionally (prediction guarantees it lands after).
+            -- A held first cast STEPS IN to the gate (tower + walk-law checked; never when
+            -- receding); a casts=0 wait past W_WAIT_RELEASE_S releases to the jungle window
+            -- (half-engaged waves are never dumped - the .301 lesson).
+            if (State.marchCasts or 0) == 0 and (dref0 > K.W_CAST_REACH or live.n < 2) then
+                s.wwD = math.min(s.wwD or dref0, dref0)
+                if dref0 > K.W_CAST_REACH and live.n >= 2 and dref0 <= (s.wwD or dref0) + 100 then
+                    local sdx, sdy = s.standSpot.aim.x - me.x, s.standSpot.aim.y - me.y
+                    local sdl = math.sqrt(sdx * sdx + sdy * sdy)
+                    if sdl > 1 then
+                        local step = dref0 - K.W_CAST_REACH + 30
+                        local tgt = Vector(me.x + sdx / sdl * step, me.y + sdy / sdl * step, me.z)
+                        -- v0.1.310: the step-in obeys tower_safe (d >= 1000, outside the real
+                        -- 900 range) - the SAME binary that clamps every stand, so it can never
+                        -- walk him into tower range for a W2 (the user's observed attack).
+                        if tower_safe({ x = tgt.x, y = tgt.y })
+                           and stand_depth({ x = tgt.x, y = tgt.y }) <= K.WALK_DEPTH_MAX + 50 then
+                            move_to(tgt, "w_stepin")
+                        end
                     end
                 end
-            end
-            if stepped then return end
-            behind = false                                       -- can't step in (far / unsafe): front now, retry behind next cast
-        end
-        -- v0.1.221 (user: "moved mid... to farm nothing - most likely the creeps being at the
-        -- edge of march"): the 950 arrival trigger casts immediately at the ~300 clamp, putting
-        -- the wave at the W's FAR EDGE (run-44: dWave 936-966 at cast = partial/zero kills).
-        -- Hold the FRONT cast until the wave closes to W_FRONT_MAX, bounded by W_EDGE_DELAY_S so
-        -- a stalling/retreating wave still gets served rather than out-waited.
-        if not behind then
-            local dWaveNow = me:Distance(s.refPoint)
-            if dWaveNow > K.W_FRONT_MAX then
-                s.castDelayUntil = s.castDelayUntil or (now() + K.W_EDGE_DELAY_S)
-                if now() < s.castDelayUntil then
-                    State.waitInfo = { why = string.format("W edge %d", math.floor(dWaveNow)), t = now() }
-                    return
+                s.wwT = s.wwT or now()
+                if now() - s.wwT > K.W_WAIT_RELEASE_S then
+                    if s.shove then suppress_shove(s.lane, now() + K.SHOVE_STUCK_S) end
+                    logline(string.format("engage_release reason=w_wait dref=%.0f n=%d casts=%d", dref0, live.n, State.marchCasts or 0))
+                    engage_replan(); return
                 end
+                State.waitInfo = { why = string.format("W wait %d n=%d c=%d", math.floor(dref0), live.n, State.marchCasts or 0), t = now() }
+                return
             end
+            s.wwT, s.wwD = nil, nil
         end
-        local tgt
-        if behind then
-            local dx, dy = aim.x - me.x, aim.y - me.y
-            local dl = math.sqrt(dx * dx + dy * dy)
-            if dl > 1 then
-                tgt = Vector(me.x - dx / dl * K.W_BEHIND_BACKSTEP, me.y - dy / dl * K.W_BEHIND_BACKSTEP, aim.z)
-            else
-                tgt = Vector(aim.x, aim.y, aim.z)
-            end
-        else
-            local lx, ly = ldir.x or 0, ldir.y or 0
-            local ll = math.sqrt(lx * lx + ly * ly)
-            local px, py = 0, 0
-            if ll >= 1e-6 then px, py = -ly / ll, lx / ll end
-            local side = ((math.floor(State.marchCasts / 2) % 2) == 0) and 1 or -1   -- alternate the wiggle side across FRONT casts
-            tgt = Vector(aim.x + px * K.MULTI_W_OFFSET * side, aim.y + py * K.MULTI_W_OFFSET * side, aim.z)
-        end
-        local cp = (me:Distance(tgt) > maxr) and (me + (tgt - me):Normalized() * maxr) or tgt
+        local cp, theta = march_cross_target(me, s.standSpot.aim)
         if cast_pos(State.march, cp) then
             State.marchPending = { cdBefore = cd_remaining(State.march), expire = now() + 1.5 }
-            -- flip the latch: behind fired -> want front; front fired AS INTENDED -> want behind;
-            -- front fired as an ineligible-behind FALLBACK -> keep wanting behind (retry next cast).
-            if behind then State.wantBehind = false
-            elseif not State.wantBehind then State.wantBehind = true end
-            logline(string.format("march_aim src=shove pat=%s lane=%s wave=(%.0f,%.0f) cast=(%.0f,%.0f) creeps=%d dWave=%.0f",
-                behind and "behind" or "front", tostring(s.lane), live.cx, live.cy, cp.x, cp.y, live.n, me:Distance(s.refPoint)))
+            State.wArm = (State.wArm == 2) and 1 or 2
+            logline(string.format("march_aim src=shove pat=x%d lane=%s wave=(%.0f,%.0f) cast=(%.0f,%.0f) creeps=%d dWave=%.0f",
+                theta, tostring(s.lane), live.cx, live.cy, cp.x, cp.y, live.n, me:Distance(s.refPoint)))
         end
     elseif effective_mana() < abil_mana(State.rearm, K.REARM_MANA_FB) + abil_mana(State.march, K.MARCH_MANA_FB) then
         -- v0.1.200 guard (run-28 t=483, belt to the hop-gate fix): in a WAVE engage Rearm exists
@@ -4483,6 +5117,36 @@ local function fsm_engage_wave(s)
         go_return()
     elseif safe_rearm() then
         logline("rearm")
+    elseif not State.rearmStepback then
+        -- v0.1.267 STEP-BACK REARM arming: the rearm was refused and by here the blockers
+        -- can only be the backoff, a cast fail, or THE CHANNEL GATE (lane_unsafe aborted the
+        -- whole engage above; the unfundable case bailed in the previous elseif). Test the
+        -- gate directly: a gating enemy in reach = walk straight AWAY from it to the first
+        -- spot the gate clears and rearm there (driver at the top of this function).
+        local thr, tpos = channel_threat_near(me)
+        if thr and tpos then
+            local dx, dy = me.x - tpos.x, me.y - tpos.y
+            local dl = math.sqrt(dx * dx + dy * dy)
+            if dl > 1 then
+                for _, step in ipairs({ 500, 800, 1100 }) do
+                    local cand = snap_walkable({ x = me.x + dx / dl * step, y = me.y + dy / dl * step }, me)
+                    if cand and not channel_threat_near(cand) then
+                        State.rearmStepback = { spot = Vector(cand.x, cand.y, 0), deadline = now() + K.REARM_STEPBACK_S }
+                        logline(string.format("rearm_stepback out d=%d threat=%s", step, thr))
+                        break
+                    end
+                end
+            end
+        end
+        -- W-GEOM-1 KITE (falls through when no gating enemy blocked the rearm): the wave
+        -- ADVANCES while we cast+rearm, and nothing above ever steps the hero BACK - he
+        -- parks while the wave (and the laner behind it) envelops him. Maintain the
+        -- standard position: the live stand (re-derived from the ranged at 810 every tick
+        -- by update_wave_spot) recedes with the wave; follow it between casts.
+        if not State.rearmStepback and not State.marchPending
+           and me:Distance(s.standSpot.aim) < K.ANTICIP_RANGED_REACH - K.STAND_KITE_EPS then
+            move_to(s.standSpot.stand, "wave_kite")
+        end
     end
 end
 
@@ -4840,7 +5504,7 @@ local function fsm_return()   -- REFILL: Keen home -> Rearm to reset Keen -> wai
         State.pressuredLogT = now(); logline("return pressured -> walk")
     end
     if not pressured and ready(State.keen) then
-        if keen_home() then logline("return keen_base") end
+        if keen_home("return") then logline("return keen_base") end
     elseif not pressured and try_rearm() then                   -- Keen on cd in the field: Rearm to reset it
         logline("return rearm_reset_keen")
     else
@@ -4931,7 +5595,7 @@ local function tick()
         -- Keen channel each tick CANCELS the in-flight teleport (the hero never gets home).
         if not is_channeling() and not has_fountain_buff() then
             if ready(State.keen) then
-                keen_home()
+                keen_home("panic")
             else
                 -- E0 (B1): keen down (stun-canceled / on cd) used to mean NO ORDERS AT ALL - a
                 -- standing-still death while panic re-armed every tick and fsm_return never ran.
@@ -4972,7 +5636,7 @@ local function tick()
                 -- free keen cancel (cd+75) then a free rearm cancel (~225), repeatable every 4s.
                 -- Blocked-and-threatened just redecides; the escape layers own the enemies.
                 if not lane_unsafe(p) then
-                    if ready(State.keen) then keen_home() elseif ready(State.rearm) then try_rearm() end
+                    if ready(State.keen) then keen_home("unstick") elseif ready(State.rearm) then try_rearm() end
                 end
                 State.spot = nil; State.fsm = "DECIDE"; State.nextDecide = 0; State.stuckTrack = nil
             end
@@ -4993,79 +5657,10 @@ end
 
 -- ── debug overlay (calibration view) ─────────────────────────────────────────
 local DBG = { font = nil }
-local function dbg_font()
-    if not DBG.font then DBG.font = Render.LoadFont("Tahoma", 0, 500) end
-    return DBG.font
-end
-local function w2s(p) return Render.WorldToScreen(p) end
-local function dbg_text(sp, text, col) Render.Text(dbg_font(), 14, text, sp, col) end
-local function world_text(wp, text, col, dx, dy)
-    local sp, vis = w2s(wp)
-    if vis then dbg_text(Vec2(sp.x + (dx or 6), sp.y + (dy or 0)), text, col) end
-end
-local function world_ring(center, radius, col, thickness)
-    -- draw arc-by-arc so a ring that is partly off-screen still shows its visible part (the old version
-    -- bailed the WHOLE ring if any single point was off-screen -> large rings never drew).
-    local seg = 36
-    local prev, pvis
-    for i = 0, seg do
-        local a = (i / seg) * math.pi * 2
-        local sp, vis = w2s(Vector(center.x + math.cos(a) * radius,
-                                   center.y + math.sin(a) * radius, center.z))
-        if i > 0 and pvis and vis then Render.Line(prev, sp, col, thickness or 1.6) end
-        prev, pvis = sp, vis
-    end
-end
-local function world_line(a, b, col, thickness)
-    local sa, va = w2s(a)
-    local sb, vb = w2s(b)
-    if va and vb then Render.Line(sa, sb, col, thickness or 1.5) end
-end
--- draw a rectangle from a start corner, `length` forward along `dir`, width 2*hw (callers
--- pass the back edge = cast point - dir*length/2 so it renders centred on the cast point).
-local function world_rect(stand, dir, length, hw, col)
-    local px, py = -dir.y, dir.x
-    local fx, fy = dir.x * length, dir.y * length
-    local ox, oy, z = px * hw, py * hw, stand.z
-    local c1 = Vector(stand.x + ox,      stand.y + oy,      z)
-    local c2 = Vector(stand.x - ox,      stand.y - oy,      z)
-    local c3 = Vector(stand.x - ox + fx, stand.y - oy + fy, z)
-    local c4 = Vector(stand.x + ox + fx, stand.y + oy + fy, z)
-    world_line(c1, c2, col); world_line(c2, c3, col)
-    world_line(c3, c4, col); world_line(c4, c1, col)
-end
-
--- draw a world-space segment subdivided, so the ON-screen part of a long edge still shows even when an
--- endpoint is off-screen (world_line alone skips the whole edge if either end is off-screen).
-local function world_seg(a, b, col, n)
-    n = n or 10
-    local prev, pvis
-    for i = 0, n do
-        local t = i / n
-        local sp, vis = w2s(Vector(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z))
-        if i > 0 and pvis and vis then Render.Line(prev, sp, col, 1.6) end
-        prev, pvis = sp, vis
-    end
-end
--- axis-aligned square of side 2*half centred on `center` (the W coverage box over a camp).
-local function world_square(center, half, col)
-    local z = center.z
-    local a = Vector(center.x - half, center.y - half, z)
-    local b = Vector(center.x + half, center.y - half, z)
-    local c = Vector(center.x + half, center.y + half, z)
-    local d = Vector(center.x - half, center.y + half, z)
-    world_seg(a, b, col); world_seg(b, c, col); world_seg(c, d, col); world_seg(d, a, col)
-end
-
--- oriented rectangle centred on `center`: half-extent `ha` along (ux,uy), `hp` along the perpendicular.
-local function world_obox(center, ux, uy, ha, hp, col)
-    local px, py, z = -uy, ux, center.z
-    local c1 = Vector(center.x + ux * ha + px * hp, center.y + uy * ha + py * hp, z)
-    local c2 = Vector(center.x + ux * ha - px * hp, center.y + uy * ha - py * hp, z)
-    local c3 = Vector(center.x - ux * ha - px * hp, center.y - uy * ha - py * hp, z)
-    local c4 = Vector(center.x - ux * ha + px * hp, center.y - uy * ha + py * hp, z)
-    world_seg(c1, c2, col); world_seg(c2, c3, col); world_seg(c3, c4, col); world_seg(c4, c1, col)
-end
+-- v0.1.324 headroom lift wave 1: the screen-space drawing family (dbg_font/w2s/dbg_text/
+-- world_text/world_ring/world_line/world_seg/world_obox) moved to lib/draw.lua as
+-- Draw.Font/W2S/Text/WorldText/Ring/Line/Seg/OBox - bodies unchanged, the font cache
+-- lives in the module now (DBG.font retired). Net -7 main-chunk locals (the 200 limit).
 
 -- one-press pair-test overlay: green ring = camp pairs (line to partner + yellow cast dot),
 -- red ring + reason = camp does not pair. Shows for K.TEST_OVERLAY_SEC after the Test key.
@@ -5073,21 +5668,21 @@ local function draw_pair_test()
     if not State.pairTestResults or now() > (State.pairTestUntil or 0) then return end
     local sz  = Render.ScreenSize()
     local hdr = "PAIR TEST  (green=clean  amber=clip  red=skip)"
-    local hw  = Render.TextSize(dbg_font(), 18, hdr)
-    Render.Text(dbg_font(), 18, hdr, Vec2(sz.x * 0.5 - hw.x * 0.5, sz.y * 0.12), Color(255, 230, 120, 255))
+    local hw  = Render.TextSize(Draw.Font(), 18, hdr)
+    Render.Text(Draw.Font(), 18, hdr, Vec2(sz.x * 0.5 - hw.x * 0.5, sz.y * 0.12), Color(255, 230, 120, 255))
     for _, r in ipairs(State.pairTestResults) do
         if r.paired then
             local clean = (r.clear == "clean")                       -- disc-model clear class -> ring colour
             local ringC = clean and Color(120, 255, 150, 255) or Color(255, 200, 80, 255)
             local lineC = clean and Color(120, 255, 150, 150) or Color(255, 200, 80, 150)
-            world_ring(r.center, 120, ringC, 2.2)
-            if r.partner then world_line(r.center, r.partner, lineC, 1.6) end
-            local cp = r.cast and w2s(r.cast)
+            Draw.Ring(r.center, 120, ringC, 2.2)
+            if r.partner then Draw.Line(r.center, r.partner, lineC, 1.6) end
+            local cp = r.cast and Draw.W2S(r.cast)
             if cp then Render.FilledCircle(cp, 5, Color(255, 200, 0, 255)) end
-            world_text(r.center, string.format("%s %d", r.clear or "?", math.floor(r.fullm or 0)), ringC, 8, -10)
+            Draw.WorldText(r.center, string.format("%s %d", r.clear or "?", math.floor(r.fullm or 0)), ringC, 8, -10)
         else
-            world_ring(r.center, 120, Color(255, 110, 110, 255), 2.0)
-            world_text(r.center, r.reason or "skip", Color(255, 150, 150, 255), 8, -10)
+            Draw.Ring(r.center, 120, Color(255, 110, 110, 255), 2.0)
+            Draw.WorldText(r.center, r.reason or "skip", Color(255, 150, 150, 255), 8, -10)
         end
     end
 end
@@ -5113,8 +5708,8 @@ local function draw_pair_debug()
 
     local sz  = Render.ScreenSize()
     local hdr = string.format("PAIR DEBUG  green=merged  amber=split(unsafe mid)  red=single  magenta=your marks   pair_max=%d", math.floor(pair_max))
-    local hw  = Render.TextSize(dbg_font(), 18, hdr)
-    Render.Text(dbg_font(), 18, hdr, Vec2(sz.x * 0.5 - hw.x * 0.5, sz.y * 0.12), Color(255, 230, 120, 255))
+    local hw  = Render.TextSize(Draw.Font(), 18, hdr)
+    Render.Text(Draw.Font(), 18, hdr, Vec2(sz.x * 0.5 - hw.x * 0.5, sz.y * 0.12), Color(255, 230, 120, 255))
 
     local me = origin(State.hero)
     local nearest, nd = nil, math.huge
@@ -5127,17 +5722,17 @@ local function draw_pair_debug()
             local mid = Vector((A.x + B.x) / 2, (A.y + B.y) / 2, A.z)
             local merged = enemy_risk_at(mid) < K.RISK_HARD
             local col = merged and Color(120, 255, 150, 255) or Color(255, 200, 80, 255)
-            world_ring(A, 110, col, 2.0); world_ring(B, 110, col, 2.0)
-            world_line(A, B, col, 1.8); world_ring(mid, 26, col, 2.0)
-            world_text(mid, string.format("%s d=%.0f", merged and "MERGED" or "split", g.d), col, 8, -10)
+            Draw.Ring(A, 110, col, 2.0); Draw.Ring(B, 110, col, 2.0)
+            Draw.Line(A, B, col, 1.8); Draw.Ring(mid, 26, col, 2.0)
+            Draw.WorldText(mid, string.format("%s d=%.0f", merged and "MERGED" or "split", g.d), col, 8, -10)
         else
-            world_ring(A, 110, Color(255, 110, 110, 255), 2.0)
-            world_text(A, "single", Color(255, 150, 150, 255), 8, -10)
+            Draw.Ring(A, 110, Color(255, 110, 110, 255), 2.0)
+            Draw.WorldText(A, "single", Color(255, 150, 150, 255), 8, -10)
         end
     end
 
     if not nearest then return end
-    world_ring(camps[nearest].center, 150, Color(255, 255, 255, 255), 2.6)   -- the camp you are inspecting
+    Draw.Ring(camps[nearest].center, 150, Color(255, 255, 255, 255), 2.6)   -- the camp you are inspecting
     local c   = camps[nearest].center
     local key = camp_key(c)
     if key == State.pairDbgKey and now() - (State.pairDbgT or 0) < 2.0 then return end   -- throttle: log on approach / every 2s
@@ -5174,10 +5769,10 @@ local function draw_pair_marks()
     local col = Color(255, 90, 255, 255)
     for i, m in ipairs(marks) do
         local p = Vector(m.pos.x, m.pos.y, m.pos.z)
-        world_ring(p, 60, col, 2.4)
-        if m.c1 then world_line(p, m.c1, col, 1.4) end
-        if m.c2 then world_line(p, m.c2, col, 1.4) end
-        world_text(p, string.format("MARK#%d d12=%.0f", i, m.d12 or -1), col, 8, 12)
+        Draw.Ring(p, 60, col, 2.4)
+        if m.c1 then Draw.Line(p, m.c1, col, 1.4) end
+        if m.c2 then Draw.Line(p, m.c2, col, 1.4) end
+        Draw.WorldText(p, string.format("MARK#%d d12=%.0f", i, m.d12 or -1), col, 8, 12)
     end
 end
 
@@ -5188,12 +5783,12 @@ local function draw_lane_scan()
     if not State.laneScan or now() > (State.laneScanUntil or 0) then return end
     local sz  = Render.ScreenSize()
     local hdr = "WAVE SCAN  (blue=enemy wave  green=ally wave  orange=MIRRORED est  yellow=clash)"
-    local hw  = Render.TextSize(dbg_font(), 18, hdr)
-    Render.Text(dbg_font(), 18, hdr, Vec2(sz.x * 0.5 - hw.x * 0.5, sz.y * 0.16), Color(255, 230, 120, 255))
+    local hw  = Render.TextSize(Draw.Font(), 18, hdr)
+    Render.Text(Draw.Font(), 18, hdr, Vec2(sz.x * 0.5 - hw.x * 0.5, sz.y * 0.16), Color(255, 230, 120, 255))
     -- Piece 1.5: draw the lane polylines (dim) so the mirrored estimates can be eyeballed ON the lane.
     for _, path in pairs(lane_paths()) do
         for i = 2, #path do
-            world_seg(Vector(path[i - 1].x, path[i - 1].y, 0), Vector(path[i].x, path[i].y, 0),
+            Draw.Seg(Vector(path[i - 1].x, path[i - 1].y, 0), Vector(path[i].x, path[i].y, 0),
                       Color(150, 150, 170, 90))
         end
     end
@@ -5204,8 +5799,8 @@ local function draw_lane_scan()
                 if not (w and w.centroid) then return end
                 -- a MIRRORED estimate draws ORANGE with its source tag, so estimate-vs-real is visible
                 local c = w.estimated and Color(255, 165, 60, 255) or col
-                world_ring(Vector(w.centroid.x, w.centroid.y, 0), 130, c, 2.0)
-                world_text(Vector(w.centroid.x, w.centroid.y, 0),
+                Draw.Ring(Vector(w.centroid.x, w.centroid.y, 0), 130, c, 2.0)
+                Draw.WorldText(Vector(w.centroid.x, w.centroid.y, 0),
                     string.format("%s x%d  g%d%s", ln, w.count, math.floor(w.gold or 0),
                         w.estimated and (" ~" .. (w.est_src or "est")) or ""), c, 8, -10)
             end
@@ -5214,16 +5809,16 @@ local function draw_lane_scan()
             if s.clash and s.clash.contact then
                 local cw = Vector(s.clash.settle.x, s.clash.settle.y, 0)
                 local crash = s.clash.crashing
-                local cp, cvis = w2s(cw)
+                local cp, cvis = Draw.W2S(cw)
                 if cvis then Render.FilledCircle(cp, 6, crash and Color(255, 80, 80, 255) or Color(255, 210, 0, 255)) end
                 if s.clash.moving then   -- drift arrow contact -> settle
-                    world_line(Vector(s.clash.contact.x, s.clash.contact.y, 0), cw, Color(255, 210, 0, 200), 2.0)
+                    Draw.Line(Vector(s.clash.contact.x, s.clash.contact.y, 0), cw, Color(255, 210, 0, 200), 2.0)
                 end
                 if crash and s.clash.crash_tower then   -- red line to the tower the wave crashes into
-                    world_line(cw, Vector(s.clash.crash_tower.pos.x, s.clash.crash_tower.pos.y, 0), Color(255, 80, 80, 220), 2.0)
+                    Draw.Line(cw, Vector(s.clash.crash_tower.pos.x, s.clash.crash_tower.pos.y, 0), Color(255, 80, 80, 220), 2.0)
                 end
                 local reach = s.intercept and s.intercept.reachable
-                world_text(cw, string.format("%s%s%s eta=%s %s",
+                Draw.WorldText(cw, string.format("%s%s%s eta=%s %s",
                     s.clash.pushing, s.clash.moving and "" or "/hold", crash and " CRASH" or "",
                     s.intercept and string.format("%.1f", s.intercept.eta) or "-",
                     reach and "OK" or "x"),
@@ -5239,14 +5834,14 @@ local function draw_route_scan()
     if not State.routeScan or now() > (State.routeScanUntil or 0) then return end
     local sz  = Render.ScreenSize()
     local hdr = "ROUTE SCAN  (cyan=camp  blue=wave  green=plan path; dim=skipped)"
-    local hw  = Render.TextSize(dbg_font(), 18, hdr)
-    Render.Text(dbg_font(), 18, hdr, Vec2(sz.x * 0.5 - hw.x * 0.5, sz.y * 0.20), Color(255, 230, 120, 255))
+    local hw  = Render.TextSize(Draw.Font(), 18, hdr)
+    Render.Text(Draw.Font(), 18, hdr, Vec2(sz.x * 0.5 - hw.x * 0.5, sz.y * 0.20), Color(255, 230, 120, 255))
     for _, t in ipairs(State.routeScan.targets or {}) do
         local skipped = t.contested or (t.risk or 0) >= K.RISK_HARD
         local base = (t.kind == "wave") and Color(120, 190, 255, 255) or Color(120, 230, 230, 255)
         local col  = skipped and Color(150, 150, 150, 160) or base
-        world_ring(Vector(t.pos.x, t.pos.y, 0), 120, col, 1.8)
-        world_text(Vector(t.pos.x, t.pos.y, 0),
+        Draw.Ring(Vector(t.pos.x, t.pos.y, 0), 120, col, 1.8)
+        Draw.WorldText(Vector(t.pos.x, t.pos.y, 0),
             string.format("%s g%.0f r%.2f%s", t.kind, t.value or 0, t.risk or 0, t.contested and " owned" or ""),
             col, 8, -10)
     end
@@ -5254,9 +5849,9 @@ local function draw_route_scan()
     local prev = origin(State.hero)
     for i, s in ipairs(steps) do
         local hereW = Vector(s.pos.x, s.pos.y, 0)
-        world_line(prev, hereW, Color(120, 255, 150, 220), i == 1 and 3.0 or 2.0)
-        world_ring(hereW, 135, Color(120, 255, 150, 255), i == 1 and 3.0 or 1.8)
-        world_text(hereW, string.format("#%d", i), Color(120, 255, 150, 255), -16, -12)
+        Draw.Line(prev, hereW, Color(120, 255, 150, 220), i == 1 and 3.0 or 2.0)
+        Draw.Ring(hereW, 135, Color(120, 255, 150, 255), i == 1 and 3.0 or 1.8)
+        Draw.WorldText(hereW, string.format("#%d", i), Color(120, 255, 150, 255), -16, -12)
         prev = hereW
     end
 end
@@ -5268,8 +5863,8 @@ local function draw_debug()
     for _, c in ipairs(State.cands or {}) do
         local isChosen = chosen and c.camp == chosen.camp
         local col = isChosen and Color(120, 255, 150, 255) or Color(255, 210, 120, 215)
-        world_ring(c.center, 110, col, isChosen and 2.4 or 1.3)
-        world_text(c.center, string.format("%s  ehp %d  g %d  x%d %s",
+        Draw.Ring(c.center, 110, col, isChosen and 2.4 or 1.3)
+        Draw.WorldText(c.center, string.format("%s  ehp %d  g %d  x%d %s",
             DBG_TIER[c.type] or "?", math.floor(c.ehp or 0), math.floor(c.gold or 0),
             camp_stacks(c.gold, c.type), c.source or "est"), col, 8, -10)
     end
@@ -5281,11 +5876,11 @@ local function draw_debug()
         if ss.paired and ss.partner then
             local ux, uy = ss.partner.x - chosen.center.x, ss.partner.y - chosen.center.y
             local ul = math.sqrt(ux * ux + uy * uy); if ul < 1 then ul = 1 end
-            world_obox(ss.aim, ux / ul, uy / ul, K.BOX_ALONG, K.BOX_PERP, Color(60, 230, 120, 235))
+            Draw.OBox(ss.aim, ux / ul, uy / ul, K.BOX_ALONG, K.BOX_PERP, Color(60, 230, 120, 235))
         else
-            world_ring(ss.aim, K.ENGAGE_COVER_DIST, Color(60, 230, 120, 235), 2.6)
+            Draw.Ring(ss.aim, K.ENGAGE_COVER_DIST, Color(60, 230, 120, 235), 2.6)
         end
-        world_text(ss.aim, "STAND BOX", Color(60, 230, 120, 255), 8, -8)
+        Draw.WorldText(ss.aim, "STAND BOX", Color(60, 230, 120, 255), 8, -8)
         -- ACTUAL W coverage: the 1800x1800 square is CENTRED ON THE REAL CAST POINT (clamped 280 ahead of
         -- the hero), NOT on the camp - so you can SEE whether a camp ends up at the square's far edge (a
         -- miss). One square per cast (multi-W: near + far). Yellow dot = the real cast point.
@@ -5294,22 +5889,22 @@ local function draw_debug()
             local cp = march_cast_point_multi(chosen, idx)
             local dx, dy = cp.x - hpos.x, cp.y - hpos.y                       -- the W sweeps along hero->cast
             local dl = math.sqrt(dx * dx + dy * dy); if dl < 1 then dl = 1 end
-            world_obox(cp, dx / dl, dy / dl, K.MARCH_LEN * 0.5, K.MARCH_HALFWIDTH, Color(120, 200, 255, 150))
-            local sp = w2s(cp); if sp then Render.FilledCircle(sp, 4, Color(255, 200, 0, 255)) end
+            Draw.OBox(cp, dx / dl, dy / dl, K.MARCH_LEN * 0.5, K.MARCH_HALFWIDTH, Color(120, 200, 255, 150))
+            local sp = Draw.W2S(cp); if sp then Render.FilledCircle(sp, 4, Color(255, 200, 0, 255)) end
         end
         -- camp markers (orange): the targets the W must actually cover
-        local ca = w2s(chosen.center); if ca then Render.FilledCircle(ca, 6, Color(255, 140, 60, 255)) end
+        local ca = Draw.W2S(chosen.center); if ca then Render.FilledCircle(ca, 6, Color(255, 140, 60, 255)) end
         if ss.paired and ss.partner then
-            local cb = w2s(Vector(ss.partner.x, ss.partner.y, z)); if cb then Render.FilledCircle(cb, 6, Color(255, 140, 60, 255)) end
+            local cb = Draw.W2S(Vector(ss.partner.x, ss.partner.y, z)); if cb then Render.FilledCircle(cb, 6, Color(255, 140, 60, 255)) end
         end
-        local st = w2s(ss.stand); if st then Render.FilledCircle(st, 6, Color(60, 230, 60, 255)) end
+        local st = Draw.W2S(ss.stand); if st then Render.FilledCircle(st, 6, Color(60, 230, 60, 255)) end
     end
-    local hs, vis = w2s(origin(State.hero))
+    local hs, vis = Draw.W2S(origin(State.hero))
     if vis then
         local txt = string.format("%s | mana %d/%d (esc %d)%s",
             State.fsm, math.floor(mana()), math.floor(NPC.GetMaxMana(State.hero) or 0),
             State.menu.escapeMana:Get(), is_channeling() and " [CHANNEL]" or "")
-        dbg_text(Vec2(hs.x + 12, hs.y - 26), txt, Color(255, 255, 255, 255))
+        Draw.Text(Vec2(hs.x + 12, hs.y - 26), txt, Color(255, 255, 255, 255))
     end
 end
 
@@ -5324,10 +5919,10 @@ local function draw_status()
         st = "WAIT " .. State.waitInfo.why
     end
     local txt  = string.format("TINKER FARM: ON  [%s]", st)
-    local ts   = Render.TextSize(dbg_font(), 18, txt)
+    local ts   = Render.TextSize(Draw.Font(), 18, txt)
     local x, y = ss.x * 0.5 - ts.x * 0.5, ss.y * 0.085
     Render.FilledRect(Vec2(x - 10, y - 5), Vec2(x + ts.x + 10, y + ts.y + 5), Color(0, 0, 0, 150), 6)
-    Render.Text(dbg_font(), 18, txt, Vec2(x, y), Color(120, 255, 150, 255))
+    Render.Text(Draw.Font(), 18, txt, Vec2(x, y), Color(120, 255, 150, 255))
 end
 
 -- ── camp-population diagnostic (answers "do camps populate?" via debug.log) ────
@@ -5680,6 +6275,6 @@ for cb_name, cb_fn in pairs(callbacks) do
     end
 end
 
-if LOG then LOG:info("Tinker brain v0.1.265 (E3c channel-breaker coverage: THE DEFENSE PHASE - the Lina save stack wired in, ~200 lines of glue, zero lib changes to the stack itself. (1) DISPATCHER: Defense.New + the TrySaveSelf chokepoint over the hero-agnostic item save bodies [24 defensive items light up as bought; generic ETA resolver only; no per-threat hand overrides day one]; defense casts go through an UNTHROTTLED order core so they never lose to the farm-order rate guard [now the single PrepareUnitOrders site, the throttled path wraps it]. (2) THREAT EVENTS: the modifier-create handler routes catalogued threats on self to the dispatcher, uncatalogued enemy-hero threats to a throttled harvest line [the automatic E3 case file], and every observed enemy disable cast to a readiness stamp. (3) FLEE = ESCAPE THEN RE-DECIDE [user decision]: break contact with the existing escape chain, suppress the commit, next decide runs the normal planner; never a forced fountain trip, never offense. (4) THE GATE NARROWS: the E1 channel gate now consults the stamps [MIN-level cd, never over-claims unreadiness] plus probed live cooldown reads on visible enemies [one-shot probe line names whether the engine answers on enemy handles]; a disabler whose whole in-reach kit is on cd no longer defers channels. (5) E1 BUG FIX FOUND IN THE WORK: the gate iterated the fog snapshot WRAPPER instead of its heroes list - E1 was INERT since v0.1.257 and fires for real for the FIRST time this build; the over-deferral watch [margin 500 down first] is now live, not theoretical. One menu switch, default ON. Suite 727/0. Banner avoids quoting the new log tokens.") end
+if LOG then LOG:info('Tinker brain v0.1.331 (KEEN INSTRUMENTATION ONLY, zero behavior change - keen-efficiency arc STEP 3 ship 1, user picked targets: camp long-walk keens + small classes [bounce/home-cycle/short-hop]; the home-refill cadence stays, accepted L1 economy. ADDED: keen_to_anchor line gains jump= [pre-cast hero pos to landing, makes keen-vs-walk economics judgeable - the 10 camp long-walks avg resid 1519 were unjudgeable without it] and mana=; keen_home FIRED gains purpose= [return/panic/unstick - decides which layer fired the 2 healthy-mana mid-camp-pick home-cycles at t=418/890 in g330] + from= + mana= via a verify_cast extra param. Consumers: parse_debuglog --keen-report [new this session] reads the fields when present. NO gate, order, or decision changed - pure loglines. VALIDATE: --keen-report on the next game shows jump/purpose columns filled; behavior identical to v0.1.330 [the stable baseline, GPM 451]. Prior build was v0.1.330.') end
 
 return callbacks

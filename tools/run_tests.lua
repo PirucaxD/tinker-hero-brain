@@ -1359,6 +1359,35 @@ describe("lib/channel_gate -- Breakers + stamps (ARC E2)", function()
     it("Breakers returns nil for a kit with no breakers", function()
         assert_eq(CG.Breakers({ "generic_nuke" }, AD, TD), nil)
     end)
+    it("LevelCleared: ability level is THE check for every breaker (run-83 user rule)", function()
+        local basic, ult = { ability = "lina_lsa" }, { ability = "necro_scythe", ult = true }
+        -- fresh ability-level-0 observation clears ANY breaker (basic or ult)
+        assert_true(CG.LevelCleared(basic, { abil = { lvl = 0, t = 100 } }, 110), "fresh lvl0 basic cleared")
+        assert_true(CG.LevelCleared(ult, { abil = { lvl = 0, t = 100 } }, 110), "fresh lvl0 ult cleared")
+        -- a skilled ability never clears; a STALE lvl-0 observation never clears (they can
+        -- spend a banked point invisibly)
+        assert_false(CG.LevelCleared(basic, { abil = { lvl = 1, t = 110 } }, 110), "skilled not cleared")
+        assert_false(CG.LevelCleared(basic, { abil = { lvl = 0, t = 100 } }, 140), "stale lvl0 not cleared")
+        -- the ult fact ages at the fastest-leveling bound (25s/level): hero seen lvl2 60s
+        -- ago reads at most ~4.4 -> cleared; lvl5 seen 30s ago could be 6 -> NOT cleared
+        assert_true(CG.LevelCleared(ult, { hero = { lvl = 2, t = 40 } }, 100), "young hero ult cleared")
+        assert_false(CG.LevelCleared(ult, { hero = { lvl = 5, t = 70 } }, 100), "near-6 hero not cleared")
+        -- hero level NEVER clears a basic (Lina LSA / Zeus Bolt class), and no obs = assume ready
+        assert_false(CG.LevelCleared(basic, { hero = { lvl = 1, t = 100 } }, 100), "hero lvl never clears basics")
+        assert_false(CG.LevelCleared(basic, nil, 100), "no observation = assume ready")
+    end)
+    it("Breakers flags ultimates (run-83: a pre-6 Necro cannot have Scythe)", function()
+        local AD3 = { CastRange = function(n) return ({ necro_scythe = 600, lion_impale = 750 })[n] end,
+                      Get = function(n) return ({ necro_scythe = { type = "ultimate" },
+                                                  lion_impale = { type = "basic" } })[n] end }
+        local TD3 = { ABILITY_TO_THREAT = { necro_scythe = "m_scythe", lion_impale = "m_impale" },
+                      THREATS_ON_SELF = { m_scythe = { role = "hard_disable" }, m_impale = { role = "hard_disable" } } }
+        local br = CG.Breakers({ "necro_scythe", "lion_impale" }, AD3, TD3)
+        local ult = {}
+        for _, b in ipairs(br) do ult[b.ability] = b.ult end
+        assert_true(ult["necro_scythe"] == true, "ultimate flagged")
+        assert_true(not ult["lion_impale"], "basic not flagged")
+    end)
     it("breaks_channel-tagged entries gate regardless of role (E3c)", function()
         local AD2 = { CastRange = function(n) return ({ ministun_bolt = 700, plain_nuke = 800 })[n] end }
         local TD2 = { ABILITY_TO_THREAT = { ministun_bolt = "m_bolt", plain_nuke = "m_nuke" },
@@ -1945,6 +1974,33 @@ describe("lib/escape - MissingCount", function()
     end)
     it("empty / nil -> 0", function()
         assert_eq(E.MissingCount({}), 0); assert_eq(E.MissingCount(nil), 0)
+    end)
+end)
+
+describe("lib/escape - ReachableFog", function()
+    local E = require("lib.escape")
+    local O = { radius = 1000, reach_cap = 450, fresh_s = 1.5 }
+    it("counts a FRESH fogged enemy whose capped disc reaches pos", function()
+        -- age 1.0 <= 1.5; disc min(550,450)=450; d 1400 - 450 = 950 <= 1000
+        local snap = { heroes = { { visible = false, age = 1.0, probable_radius = 550, pos = { x = 1400, y = 0 } } } }
+        assert_eq(E.ReachableFog(snap, { x = 0, y = 0 }, O), 1)
+    end)
+    it("EXCLUDES a stale fogged enemy (age > fresh_s)", function()
+        local snap = { heroes = { { visible = false, age = 3.0, probable_radius = 1650, pos = { x = 1400, y = 0 } } } }
+        assert_eq(E.ReachableFog(snap, { x = 0, y = 0 }, O), 0)
+    end)
+    it("EXCLUDES a fresh enemy too far even with the disc", function()
+        -- d 2000 - min(275,450)=275 = 1725 > 1000
+        local snap = { heroes = { { visible = false, age = 0.5, probable_radius = 275, pos = { x = 2000, y = 0 } } } }
+        assert_eq(E.ReachableFog(snap, { x = 0, y = 0 }, O), 0)
+    end)
+    it("ignores VISIBLE enemies (they are not fog)", function()
+        local snap = { heroes = { { visible = true, pos = { x = 100, y = 0 } } } }
+        assert_eq(E.ReachableFog(snap, { x = 0, y = 0 }, O), 0)
+    end)
+    it("nil-safe", function()
+        assert_eq(E.ReachableFog(nil, { x = 0, y = 0 }, O), 0)
+        assert_eq(E.ReachableFog({}, { x = 0, y = 0 }, O), 0)
     end)
 end)
 
@@ -4368,6 +4424,192 @@ describe("lib/towers -- registry: alive flag + measured hp-slope death eta", fun
         st = TW.Track(st, { { key = KEY, hp = 900, alive = true } }, 102)
         st = TW.Track(st, { { key = KEY, hp = 1100, alive = true } }, 104)   -- healing up
         assert_eq(TW.DeathEta(st, KEY, 104), math.huge)
+    end)
+end)
+
+describe("lib/lane -- Depth (S2 per-lane ruler, the side-parity fix)", function()
+    local LN = require("lib.lane")
+    local MD = require("lib.map_data")
+    local r2 = LN.DepthRuler(MD.TOWERS, MD.FOUNTAINS, 2)   -- Radiant
+    local r3 = LN.DepthRuler(MD.TOWERS, MD.FOUNTAINS, 3)   -- Dire
+    it("zeros at each lane's T1 midpoint, both teams", function()
+        for _, ln in ipairs({ "mid", "top", "bot" }) do
+            local z = r2.zero[ln]
+            assert_true(z ~= nil, ln .. " zero exists")
+            assert_true(math.abs(LN.Depth(r2, z, ln)) < 1, ln .. " centre reads 0 (Radiant)")
+            assert_true(math.abs(LN.Depth(r3, z, ln)) < 1, ln .. " centre reads 0 (Dire)")
+        end
+    end)
+    it("own mid T1 ~-1459, enemy mid T1 ~+1459, both teams", function()
+        local rT1 = { x = -1544, y = -1408 }   -- Radiant mid T1 (map_data)
+        local dT1 = { x = 524, y = 652 }       -- Dire mid T1
+        assert_true(math.abs(LN.Depth(r2, rT1, "mid") - -1458) < 10, "Radiant: own T1 depth")
+        assert_true(math.abs(LN.Depth(r2, dT1, "mid") - 1458) < 10, "Radiant: enemy T1 depth")
+        assert_true(math.abs(LN.Depth(r3, dT1, "mid") - -1458) < 10, "Dire: own T1 depth")
+        assert_true(math.abs(LN.Depth(r3, rT1, "mid") - 1458) < 10, "Dire: enemy T1 depth")
+    end)
+    it("documents the healed defect: the old zero (fountain mid) sits ~583 DIRE-ward of the lane centre", function()
+        local fm = { x = (7408 - 7456) / 2, y = (6848 - 6938) / 2 }   -- the old ruler's zero
+        -- consequence on the OLD ruler: Dire read the lane centre at +583 (past WALK_DEPTH_MAX 550
+        -- = could not even dispatch to its own meet), Radiant read it at -583 (band reached
+        -- centre+1133). The new per-lane zero + WALK_DEPTH_MAX 1100 gives BOTH sides centre+1100.
+        assert_true(math.abs(LN.Depth(r3, fm, "mid") - -583) < 15, "Dire: the old zero sat ~583 OWN-side of the lane centre")
+        assert_true(math.abs(LN.Depth(r2, fm, "mid") - 583) < 15, "Radiant: the old zero sat ~583 ENEMY-side of the lane centre")
+    end)
+    it("team antisymmetry on mid", function()
+        for _, p in ipairs({ { x = 0, y = 0 }, { x = -900, y = -750 }, { x = 476, y = 352 } }) do
+            local a, b = LN.Depth(r2, p, "mid"), LN.Depth(r3, p, "mid")
+            assert_true(math.abs(a + b) < 1, string.format("Depth2(%d,%d) == -Depth3", p.x, p.y))
+        end
+    end)
+end)
+
+describe("lib/lane -- CreepStats (W-GEOM-2 sim input)", function()
+    local Lane = require("lib.lane")
+    it("melee at t=0 reads base stats", function()
+        local s = Lane.CreepStats("melee", 0)
+        assert_eq(s.hp, 550); assert_eq(s.gold, 39)
+    end)
+    it("ranged scales per 450s cycle", function()
+        local s = Lane.CreepStats("ranged", 900)          -- cycle 2
+        assert_eq(s.hp, 324); assert_eq(s.gold, 58)
+    end)
+    it("unknown kind -> nil", function()
+        assert_eq(Lane.CreepStats("courier", 0), nil)
+    end)
+end)
+
+describe("lib/march_sim -- cast geometry (W-GEOM-2)", function()
+    local MS = require("lib.march_sim")
+    it("straight cast: point clamped to 300 toward aim, facing hero->aim", function()
+        local c = MS.Cast({ x = 0, y = 0 }, { x = 810, y = 0 }, 0)
+        assert_true(math.abs(c.cx - 300) < 1 and math.abs(c.cy) < 1, "cast point at 300,0")
+        assert_true(math.abs(c.fx - 1) < 0.001 and math.abs(c.fy) < 0.001, "facing +x")
+    end)
+    it("theta rotates the facing off the aim axis", function()
+        local c = MS.Cast({ x = 0, y = 0 }, { x = 810, y = 0 }, 30)
+        assert_true(math.abs(c.fx - math.cos(math.rad(30))) < 0.001, "fx = cos30")
+        assert_true(math.abs(c.fy - math.sin(math.rad(30))) < 0.001, "fy = sin30")
+    end)
+    it("behind cast: 60u backstep flip, spawn edge at hero+840 along the axis", function()
+        local c = MS.Cast({ x = 0, y = 0 }, { x = 810, y = 0 }, 0, true)
+        assert_true(math.abs(c.fx + 1) < 0.001, "facing flipped (-x)")
+        -- spawn edge = cast - 900*facing = (-60) - 900*(-1) = +840
+        assert_true(math.abs((c.cx - 900 * c.fx) - 840) < 1, "spawn edge +840")
+    end)
+end)
+
+describe("lib/march_sim -- attrition sim (W-GEOM-2)", function()
+    local MS = require("lib.march_sim")
+    local Lane = require("lib.lane")
+
+    it("spawns 144 robots per cast; a centered stationary creep dies", function()
+        local r = MS.Simulate({
+            hero = { x = 0, y = 0 },
+            creeps = { { x = 600, y = 0, hp = 80, kind = "melee" } },
+            wave_speed = 0, dmg = 40,
+            casts = { { t = 0, theta = 0 } },
+        })
+        assert_eq(r.robots, 144)
+        assert_true(r.creeps[1].died_at ~= nil, "centered creep dies")
+        assert_true(r.cleared, "wave cleared")
+    end)
+    it("creep outside the corridor is untouched", function()
+        local r = MS.Simulate({
+            hero = { x = 0, y = 0 },
+            creeps = { { x = 600, y = 0, hp = 80, kind = "ranged" },   -- the aim anchor
+                       { x = 600, y = 1200, hp = 80, kind = "melee" } },
+            wave_speed = 0, dmg = 40,
+            casts = { { t = 0, theta = 0 } },
+        })
+        assert_true(r.creeps[2].died_at == nil and r.creeps[2].hp == 80, "off-corridor creep untouched")
+    end)
+    it("screening: the front creep on the same lane dies before the rear one", function()
+        local r = MS.Simulate({
+            hero = { x = 0, y = 0 },
+            creeps = { { x = 500, y = 0, hp = 400, kind = "melee" },
+                       { x = 900, y = 0, hp = 400, kind = "ranged" } },   -- 400 apart: no splash bleed
+            wave_speed = 0, dmg = 40,
+            casts = { { t = 0, theta = 0 } },
+        })
+        local front, rear = r.creeps[1], r.creeps[2]
+        assert_true(front.died_at ~= nil, "front dies")
+        assert_true(rear.died_at == nil or rear.died_at > front.died_at, "rear outlives the screen")
+    end)
+    it("splash: a neighbor within 150 of the impact takes damage", function()
+        local r = MS.Simulate({
+            hero = { x = 0, y = 0 },
+            creeps = { { x = 600, y = 0, hp = 5000, kind = "melee" },
+                       { x = 600, y = 100, hp = 5000, kind = "melee" } },
+            wave_speed = 0, dmg = 40,
+            casts = { { t = 0, theta = 0 } },
+        })
+        assert_true(r.creeps[2].hp < 5000, "splash neighbor damaged")
+    end)
+    -- THE W-GEOM-2 GATE (verdict pinned; see tools/w_geom_report.lua for the matrix + CS
+    -- sweep): NARROW X arms (+-20..30) keep both streams' melee shadows aligned on the
+    -- ranged - it survives the static fight at W lvl2. WIDE asymmetric arms (user-corrected
+    -- pro X, e.g. 45/-90) decorrelate the shadows: the ranged dies, and on the jittered
+    -- last-hit-race sweep the wide X and today's front+behind are gold-equivalent. The
+    -- angle question is settled by physics: wide or don't bother.
+    local function stand_wave(gt)
+        return MS.MakeWave({
+            ranged = { x = 810, y = 0 }, walk = { x = -1, y = 0 },
+            melee_hp = Lane.CreepStats("melee", gt).hp,
+            ranged_hp = Lane.CreepStats("ranged", gt).hp,
+        })
+    end
+    local function ranged_of(r)
+        for _, c in ipairs(r.creeps) do if c.kind == "ranged" then return c end end
+    end
+    it("walking wave at the 810 stand: ranged dies within 2 casts (today AND X 20/30/45)", function()
+        local pats = { { { t = 0, theta = 0 }, { t = 3.5, behind = true } } }
+        for _, th in ipairs({ 20, 30, 45 }) do pats[#pats + 1] = { { t = 0, theta = th }, { t = 3.5, theta = -th } } end
+        for pi, casts in ipairs(pats) do
+            local r = MS.Simulate({ hero = { x = 0, y = 0 }, creeps = stand_wave(600),
+                                    walk = { x = -1, y = 0 }, wave_speed = 325, dmg = 40, casts = casts })
+            local rg = ranged_of(r)
+            assert_true(rg.died_at and rg.died_cast <= 2, "pattern " .. pi .. ": ranged dies within 2 casts")
+        end
+    end)
+    it("walking wave at the 400 stand (v0.1.326 forward pre-position): ranged dies within 2 casts", function()
+        -- the fogged pre-position moves from meeting-810 to meeting-W_PRE_STAND_BACK (400):
+        -- same kill bar as the 810 test, wave arriving at the closer stand, all patterns.
+        local pats = { { { t = 0, theta = 0 }, { t = 3.5, behind = true } } }
+        for _, th in ipairs({ 20, 30, 45 }) do pats[#pats + 1] = { { t = 0, theta = th }, { t = 3.5, theta = -th } } end
+        for pi, casts in ipairs(pats) do
+            local r = MS.Simulate({ hero = { x = 0, y = 0 },
+                                    creeps = MS.MakeWave({ ranged = { x = 400, y = 0 }, walk = { x = -1, y = 0 },
+                                                           melee_hp = Lane.CreepStats("melee", 600).hp,
+                                                           ranged_hp = Lane.CreepStats("ranged", 600).hp }),
+                                    walk = { x = -1, y = 0 }, wave_speed = 325, dmg = 40, casts = casts })
+            local rg = ranged_of(r)
+            assert_true(rg.died_at and rg.died_cast <= 2, "pattern " .. pi .. ": ranged dies within 2 casts at the 400 stand")
+        end
+    end)
+    it("last-hit race: bg_dps kills attribute to the own wave, robot kills to us (cs)", function()
+        local r = MS.Simulate({
+            hero = { x = 0, y = 0 },
+            creeps = { { x = 600, y = 0, hp = 80, kind = "melee" },        -- in-corridor: robots race the bg
+                       { x = 600, y = 1400, hp = 50, kind = "melee" } },   -- off-corridor: only bg touches it
+            wave_speed = 0, dmg = 40, bg_dps = 20,
+            casts = { { t = 0, theta = 0 } },
+        })
+        assert_eq(r.creeps[1].died_to, "robot", "in-corridor creep last-hit by a robot")
+        assert_eq(r.creeps[2].died_to, "bg", "off-corridor creep dies to the own wave")
+        assert_eq(r.cs, 1, "cs counts only robot kills")
+    end)
+    it("STATIC early wave: narrow X leaves the ranged screened; behind AND wide X kill it", function()
+        local function run(casts)
+            return MS.Simulate({ hero = { x = 0, y = 0 }, creeps = stand_wave(300),
+                                 wave_speed = 0, dmg = 22, casts = casts })
+        end
+        local today = run({ { t = 0, theta = 0 }, { t = 3.5, behind = true } })
+        assert_true(ranged_of(today).died_at ~= nil, "front+behind kills the static ranged")
+        local x20 = run({ { t = 0, theta = 20 }, { t = 3.5, theta = -20 } })
+        assert_true(ranged_of(x20).died_at == nil, "narrow X20: shadows aligned, ranged survives")
+        local wide = run({ { t = 0, theta = 45 }, { t = 3.5, theta = -90 } })
+        assert_true(ranged_of(wide).died_at ~= nil, "wide X 45/-90: shadows decorrelated, ranged dies")
     end)
 end)
 

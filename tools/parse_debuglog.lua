@@ -45,6 +45,12 @@ Options:
                          cannot unlock any camp even at the mana ceiling (need > cap), and flags
                          illegal singles (paired=false pick with a partner in pair range, nnd<=1800).
                          Zero violations = the gate + pair rule held. Run after EVERY session.
+  --keen-report          THE KEEN-EFFICIENCY LEDGER: every keen (keen_to_anchor + keen_home)
+                         classified by outcome - bounce (re-keen <15s, nothing farmed), long-walk
+                         (residual > 1000), home-cycle (keen_home outside a refill/recover pick),
+                         home-refill, raid, productive (cast/farm followed), short-hop (rest) -
+                         with caller (lane_go variant), nearest decide's pick/mana/klvl, and
+                         estimated keen mana per class (Keen 75 flat; rearm_reset rungs +~225).
 
 ]])
 end
@@ -88,7 +94,10 @@ for i = 1, #arg do
     elseif a == "--cycle-report" then mode = "cycle_report"; mode_count = mode_count + 1
     elseif a == "--time-report" then mode = "time_report"; mode_count = mode_count + 1
     elseif a == "--depth-audit" then mode = "depth_audit"; mode_count = mode_count + 1
+    elseif a == "--cast-report" then mode = "cast_report"; mode_count = mode_count + 1
+    elseif a == "--convert-report" then mode = "convert_report"; mode_count = mode_count + 1
     elseif a == "--farm-audit" then mode = "farm_audit"; mode_count = mode_count + 1
+    elseif a == "--keen-report" then mode = "keen_report"; mode_count = mode_count + 1
     elseif a == "--help" or a == "-h" then usage(); os.exit(0)
     end
 end
@@ -845,6 +854,124 @@ elseif mode == "cycle_report" then
     print(string.format("tether time: %.0fs   early timed casts (trig=time eta_err>+3s): %d", tether_s, early))
     print("targets: transit share < 10%, early timed casts = 0, tether lines present on fogged cycles")
     os.exit(0)
+elseif mode == "keen_report" then
+    -- Keen-efficiency arc STEP 1 (bridge 2026-07-20): every keen classified by outcome.
+    -- Events: keen_to_anchor (fields: anchor/land/residual) + keen_home (bare). The lane_go
+    -- line logs AFTER the keen helper returns -> stamp it onto the latest unstamped anchor.
+    -- Clock interpolates from kv.t (decides + 2s wavescan), same as cycle_report.
+    -- Known log gaps (instrumentation candidates if the classes look wrong): no from-position
+    -- on any keen (jump length unknowable -> "walk was comparable" is judged by residual only),
+    -- keen_home has no coords/purpose, no mana on cast lines (nearest decide's mana= stands in).
+    local now_t, t_first = 0, nil
+    local keens, acts, dec, pending = {}, {}, nil, nil
+    for seq, e in ipairs(events) do
+        local ts = tonumber(e.kv.t); if ts then now_t = ts end
+        if e.event == "farm" and e.kv.pick then
+            t_first = t_first or now_t
+            dec = { t = now_t, pick = e.kv.pick, mana = e.kv.mana, klvl = e.kv.klvl,
+                    reason = e.kv.reason, act = e.kv.act }
+        elseif e.event == "keen_to_anchor" then
+            local k = { t = now_t, seq = seq, kind = "anchor", anchor = e.kv.anchor,
+                residual = tonumber(e.kv.residual), dec = dec,
+                jump = tonumber(e.kv.jump), cmana = e.kv.mana }   -- v0.1.331 instrumentation
+            -- rearm_reset_keen logs BEFORE its keen (the rearm channel sits between) and is a
+            -- mana fact (rearm burned on top), not the purpose: flag it, let lane_go name the purpose
+            if pending and now_t - pending.t <= 8 then k.rearm = true end
+            pending = nil
+            keens[#keens + 1] = k
+        elseif e.event == "keen_home" then
+            keens[#keens + 1] = { t = now_t, seq = seq, kind = "home", dec = dec,
+                purpose = e.kv.purpose, cmana = e.kv.mana }       -- v0.1.331 instrumentation
+            pending = nil
+        elseif e.event == "lane_go" then
+            local variant = e.raw:match("lane_go%s+(.+)$")
+            local k = keens[#keens]
+            if variant and variant:find("keen") then
+                if k and k.kind == "anchor" and not k.caller and now_t - k.t <= 5 then
+                    k.caller = variant          -- lane_go keen / keen raid log AFTER the cast
+                else
+                    pending = { variant = variant, t = now_t }
+                end
+            end
+        elseif e.event == "march_aim" or e.event == "engage_done" or e.event == "refill_done" then
+            acts[#acts + 1] = { t = now_t, seq = seq, what = e.event }
+        end
+    end
+    -- stream order (seq), not clock, decides before/after: the 2s interpolated clock ties a
+    -- same-window cast to its keen (raids cast ~2s after landing) and a > test dropped them;
+    -- seq1 (the next keen) bounds the other side so a tied-clock act never double-attributes
+    local function farmed_between(seq0, t1, seq1)
+        for _, a in ipairs(acts) do
+            if a.seq > seq0 and a.t <= t1 and (not seq1 or a.seq < seq1) then return a.what end
+        end
+        return nil
+    end
+    local BOUNCE_S, PROD_S, LONGWALK_R = 15, 25, 1000
+    local order = { "bounce", "home-cycle", "long-walk", "short-hop", "home-refill", "raid", "productive" }
+    local classes = {}
+    for _, c in ipairs(order) do classes[c] = { n = 0, resid = 0, residn = 0, mana = 0 } end
+    local callers = {}
+    for i, k in ipairs(keens) do
+        local nxt = keens[i + 1]
+        k.ndt = nxt and (nxt.t - k.t) or nil
+        local horizon = math.min(k.t + PROD_S, nxt and nxt.t or (k.t + PROD_S))
+        k.farmed = farmed_between(k.seq, horizon, nxt and nxt.seq)
+        if k.kind == "home" then
+            local genuine = k.dec and (k.dec.pick == "refill" or k.dec.act == "recover")
+            k.class = genuine and "home-refill" or "home-cycle"
+        elseif k.caller and k.caller:find("raid") then
+            k.class = "raid"
+        elseif k.ndt and k.ndt <= BOUNCE_S and not farmed_between(k.seq, nxt.t, nxt.seq) then
+            k.class = "bounce"
+        elseif k.residual and k.residual > LONGWALK_R then
+            k.class = "long-walk"
+        elseif k.farmed then
+            k.class = "productive"
+        else
+            k.class = "short-hop"
+        end
+        local c = classes[k.class]
+        c.n = c.n + 1
+        c.mana = c.mana + 75 + (k.rearm and 225 or 0)
+        if k.residual then c.resid = c.resid + k.residual; c.residn = c.residn + 1 end
+        local cal = k.kind == "home" and "home" or ((k.rearm and "rearm+" or "") .. (k.caller or "-"))
+        callers[cal] = (callers[cal] or 0) + 1
+    end
+    local span = math.max(1, now_t - (t_first or 0))
+    print(string.format("--- keen report --- %d keens in %.0fs of farm (one every %.1fs)", #keens, span, span / math.max(1, #keens)))
+    print(string.format("%-7s %-7s %-17s %-6s %-6s %-6s %-12s %-11s %s",
+        "t", "kind", "caller/purpose", "resid", "jump", "next", "farmed", "class", "decide[pick mana klvl reason]"))
+    for _, k in ipairs(keens) do
+        local d = k.dec or {}
+        print(string.format("%-7.1f %-7s %-17s %-6s %-6s %-6s %-12s %-11s %s %s klvl=%s %s%s",
+            k.t, k.kind == "home" and "home" or ("a=" .. tostring(k.anchor)),
+            k.kind == "home" and (k.purpose or "-") or ((k.rearm and "rearm+" or "") .. (k.caller or "-")),
+            k.residual and string.format("%d", k.residual) or "-",
+            k.jump and string.format("%d", k.jump) or "-",
+            k.ndt and string.format("%.0fs", k.ndt) or "-",
+            k.farmed or "-", k.class,
+            d.pick or "?", d.mana and ("mana=" .. d.mana) or "mana=?", d.klvl or "?", d.reason or "",
+            k.cmana and (" castmana=" .. k.cmana) or ""))
+    end
+    print("\nclass                n   est_mana  avg_resid")
+    local tot_mana = 0
+    for _, cname in ipairs(order) do
+        local c = classes[cname]
+        tot_mana = tot_mana + c.mana
+        if c.n > 0 then
+            print(string.format("%-18s %3d   %6d    %s", cname, c.n, c.mana,
+                c.residn > 0 and string.format("%.0f", c.resid / c.residn) or "-"))
+        end
+    end
+    print(string.format("total est keen mana: %d (Keen 75 flat; +225 per rearm_reset rung, level estimate)", tot_mana))
+    local cal_parts = {}
+    for cal, n in pairs(callers) do cal_parts[#cal_parts + 1] = cal .. "=" .. n end
+    table.sort(cal_parts)
+    print("callers: " .. table.concat(cal_parts, " "))
+    print("classes: bounce = re-keen <" .. BOUNCE_S .. "s with nothing farmed | home-cycle = fountain TP outside a refill/recover pick")
+    print("         long-walk = residual >" .. LONGWALK_R .. " (the keen bought a long walk anyway) | short-hop = no farm evidence within " .. PROD_S .. "s")
+    print("         home-refill / raid / productive = the designed uses")
+    os.exit(0)
 elseif mode == "time_report" then
     -- GPM study instrument: classify the WHOLE run. A segment = one farm decide's action
     -- (decide -> next decide); the clock interpolates from any kv.t event (farm decides + the
@@ -859,12 +986,19 @@ elseif mode == "time_report" then
     local function close(t)
         if cur then cur.t1 = t; segs[#segs + 1] = cur; cur = nil end
     end
+    local last_scan = nil  -- pre-position diagnosis: most-recent wavescan SCAN (grid pred vs kin kpred)
     for _, e in ipairs(events) do
         local ts = tonumber(e.kv.t); if ts then now_t = ts end
-        if e.event == "farm" then
+        if e.event == "wavescan" and e.kv.pred and not e.kv.ln then
+            last_scan = { pred = tonumber(e.kv.pred), kpred = tonumber(e.kv.kpred),
+                          lastw = tonumber(e.kv.lastw), t = ts }
+        elseif e.event == "farm" then
             close(now_t)
             cur = { t0 = now_t, pick = e.kv.pick or "?", reason = e.kv.reason or "-",
                     travel = tonumber(e.kv.travel) or 0, gpm = tonumber(e.kv.gpm),
+                    -- pre-position fog-timing capture (near_due idle diagnosis): the decide's own
+                    -- predicted arrival + slack, and the grid/kin estimates in force at decide time
+                    dl = tonumber(e.kv.dl), slack = tonumber(e.kv.slack), asrc = e.kv.asrc, scan = last_scan,
                     -- ALL-LANES: a side shove segment keys its time/gold as shove:top|bot
                     key = (e.kv.pick == "shove" and e.kv.lane and e.kv.lane ~= "mid")
                           and ("shove:" .. e.kv.lane) or (e.kv.pick or "?") }
@@ -872,7 +1006,11 @@ elseif mode == "time_report" then
             if e.event == "tether" then cur.teth0 = cur.teth0 or now_t
             elseif e.event == "step_out" or e.event == "wave_engage_arrived" or e.event == "engage_arrived" then
                 if cur.teth0 then cur.teth = (cur.teth or 0) + (now_t - cur.teth0); cur.teth0 = nil end
-                if e.event ~= "step_out" then cur.arr = cur.arr or now_t end
+                if e.event ~= "step_out" then cur.arr = cur.arr or now_t
+                elseif e.kv.eta then  -- keen/anchor step_out (has eta/walk/d), not the "live" close/meet form
+                    cur.eta = tonumber(e.kv.eta); cur.walk_s = tonumber(e.kv.walk); cur.dstep = tonumber(e.kv.d)
+                end
+            elseif e.event == "keen_to_anchor" then cur.residual = tonumber(e.kv.residual)
             elseif e.event == "engage_done" or e.event == "refill_done" then
                 cur.done = cur.done and math.max(cur.done, now_t) or now_t
             end
@@ -915,7 +1053,9 @@ elseif mode == "time_report" then
         end
         if hold_s > 10 then
             holds[#holds + 1] = { t0 = s.t0, pick = s.pick, reason = s.reason, dur = dur,
-                hold = hold_s, phases = s.phases }
+                hold = hold_s, phases = s.phases,
+                eta = s.eta, walk_s = s.walk_s, residual = s.residual,
+                dl = s.dl, slack = s.slack, dtravel = s.travel, scan = s.scan }
         end
     end
     local t0, t1 = segs[1].t0, segs[#segs].t1
@@ -951,7 +1091,179 @@ elseif mode == "time_report" then
         local h = holds[i]
         print(string.format("    t=%-6.1f %-7s hold=%5.1fs seg=%5.1fs reason=%-14s %s",
             h.t0, h.pick, h.hold, h.dur, h.reason, h.phases or ""))
+        if h.eta then  -- pre-position fog-timing: mechanically pair step_out eta vs decide dl vs wavescan pred/kpred
+            local sc = h.scan or {}
+            local idle = h.dl and (h.dl - h.eta) or nil
+            print(string.format("             fog-timing: eta=%.1f (out+%.1f, keen resid=%s) walk_s=%s | decide[dl=%s slack=%s trav=%s] wavescan[pred=%s kpred=%s] -> idle(dl-eta)=%s",
+                h.eta, h.eta - h.t0, tostring(h.residual or "?"), tostring(h.walk_s or "?"),
+                tostring(h.dl or "?"), tostring(h.slack or "?"), tostring(h.dtravel or "?"),
+                tostring(sc.pred or "?"), tostring(sc.kpred or "?"),
+                idle and string.format("%.1f", idle) or "?"))
+        end
     end
+    os.exit(0)
+elseif mode == "convert_report" then
+    -- THE CONVERT-CONTEXT INSTRUMENT (churn arc entry, 2026-07-20): per overdue_convert,
+    -- reconstruct what every clock believed at the abandon - the committed deadline (the
+    -- decide's dl + the frozen kinematic s.waveEta family), the live scanner (SCAN
+    -- pred/kpred + the per-lane ln eta), casts already spent - and when the real wave
+    -- materialized AFTER the bail (the abandon error). Resolves the over~15-17 mystery
+    -- (which quantity `over` measures) and sizes the false-abandon rate for the fix.
+    local now_t, ev_t = 0, {}
+    for i, e in ipairs(events) do
+        local ts = tonumber(e.kv.t); if ts then now_t = ts end
+        ev_t[i] = now_t
+    end
+    local n, errs = 0, {}
+    for i, e in ipairs(events) do
+        if e.event == "overdue_convert" then
+            n = n + 1
+            local lane = e.kv.lane or "mid"
+            local tc = ev_t[i]
+            -- backward: last same-lane shove commit, last SCAN, last ln= scan, casts since commit
+            local commit, scan, lscan, casts = nil, nil, nil, 0
+            for j = i - 1, 1, -1 do
+                local p = events[j]
+                if not commit and p.event == "farm" and p.kv.pick == "shove" and (p.kv.lane or "mid") == lane then
+                    commit = { t = ev_t[j], dl = tonumber(p.kv.dl), asrc = p.kv.asrc,
+                               slack = p.kv.slack, vis = p.kv.vis }
+                end
+                if not scan and p.event == "wavescan" and p.kv.pred and not p.kv.ln then
+                    scan = { pred = tonumber(p.kv.pred), kpred = tonumber(p.kv.kpred) }
+                end
+                if not lscan and p.event == "wavescan" and p.kv.ln == lane then
+                    lscan = { eta = tonumber(p.kv.eta), est = p.kv.est, reach = p.kv.reach }
+                end
+                if not commit and p.event == "march_aim"
+                   and (p.kv.src == "shove" or p.kv.src == "shove_pre" or p.kv.src == "shove_w2") then
+                    casts = casts + 1
+                end
+                if commit and scan and lscan then break end
+                if tc - ev_t[j] > 60 then break end
+            end
+            -- forward: when did the real wave show (arrival event, real ln scan, or vis=y decide)
+            local treal = nil
+            for j = i + 1, #events do
+                local p = events[j]
+                if p.event == "wave_engage_arrived" or p.event == "engage_arrived"
+                   or (p.event == "wavescan" and p.kv.ln == lane and p.kv.est == "n")
+                   or (p.event == "farm" and (p.kv.lane or "mid") == lane and p.kv.vis == "y") then
+                    treal = ev_t[j]; break
+                end
+                if ev_t[j] - tc > 40 then break end
+            end
+            print(string.format("convert #%d t=%.1f lane=%s over=%s", n, tc, lane, e.kv.over or "?"))
+            if commit then
+                print(string.format("    commit t=%.1f dl=%s asrc=%s slack=%s vis=%s | conv-commit=%.1f conv-dl=%s casts_since=%d",
+                    commit.t, tostring(commit.dl), tostring(commit.asrc), tostring(commit.slack), tostring(commit.vis),
+                    tc - commit.t, commit.dl and string.format("%+.1f", tc - commit.dl) or "?", casts))
+            end
+            if scan or lscan then
+                print(string.format("    scanner: SCAN kpred%s pred%s | ln eta=%s est=%s reach=%s",
+                    scan and scan.kpred and string.format("=now%+.1f", scan.kpred - tc) or "=?",
+                    scan and scan.pred and string.format("=now%+.1f", scan.pred - tc) or "=?",
+                    lscan and tostring(lscan.eta) or "?", lscan and tostring(lscan.est) or "?",
+                    lscan and tostring(lscan.reach) or "?"))
+            end
+            if treal then
+                errs[#errs + 1] = treal - tc
+                print(string.format("    real wave materialized %+.1fs after the abandon", treal - tc))
+            else
+                print("    no wave materialized within 40s (a TRUE phantom)")
+            end
+        end
+    end
+    if n == 0 then print("(no overdue_convert events)") end
+    if #errs > 0 then
+        table.sort(errs)
+        print(string.format("\nconverts: %d | wave materialized after: %d (median %+.1fs) | true phantoms: %d",
+            n, #errs, errs[math.ceil(#errs / 2)], n - #errs))
+    end
+    os.exit(0)
+elseif mode == "cast_report" then
+    -- THE CAST-OUTCOME INSTRUMENT (step-2 brainstorm 2026-07-20): pair every lane W cast
+    -- with what the wave actually did next, so "the pre-casts whiff" is a MEASURED rate,
+    -- not an impression (the .322 mirror-misattribution lesson). Classes:
+    --   shove_pre live (tarr=)  - the W-GEOM-3 lead cast on a VISIBLE closing wave
+    --   shove_pre/w2 fog (teta=) - the stamp-timed fog preempt (fog=y)
+    --   shove_w2 (dref=)        - the consecutive W2 (judged by reach, MARCH_REACH 1150)
+    --   shove (dWave=)          - the at-arrival cast (baseline, always on the wave)
+    -- Outcome scan (+25s or the next farm decide): first arrival event vs the cast's own
+    -- lead -> HIT (arr <= lead+2), PARTIAL (<= lead+6, robots still sweeping), LATE, or
+    -- GONE (convert/no_wave/nothing = the wave never came). Timestamps interpolate from
+    -- the 2s wavescan cadence (+-2s is fine for a 6s robot sweep).
+    -- Ends with the wasted-trip recount so the whiff cost sizes against the churn.
+    local now_t, ev_t, casts = 0, {}, {}
+    for i, e in ipairs(events) do
+        local ts = tonumber(e.kv.t); if ts then now_t = ts end
+        ev_t[i] = now_t
+        if e.event == "march_aim" then
+            local src = e.kv.src
+            if src == "shove_pre" or src == "shove_w2" or src == "shove" then
+                casts[#casts + 1] = { i = i, t = now_t, src = src, fog = (e.kv.fog == "y"),
+                    lead = tonumber(e.kv.tarr) or tonumber(e.kv.teta),
+                    dw = tonumber(e.kv.dWave) or tonumber(e.kv.dref) }
+            end
+        end
+    end
+    for _, c in ipairs(casts) do
+        local lead = math.max(c.lead or 0, 0)
+        for j = c.i + 1, #events do
+            local e, te = events[j], ev_t[j]
+            if te > c.t + 25 or (e.event == "farm" and te > c.t + 1) then break end
+            if e.event == "wave_engage_arrived" or e.event == "engage_arrived" then
+                c.arr = c.arr or te
+            elseif e.event == "engage_done" then c.done = te; break
+            elseif e.event == "overdue_convert" or (e.event == "shove_move" and (e.raw or ""):find("no_wave", 1, true)) then
+                c.gone = te; break
+            end
+        end
+        if c.src == "shove" then c.class = "arrival"
+        elseif c.src == "shove_w2" then
+            c.class = (not c.fog) and ((c.dw or 0) <= 1150 and "w2_in_reach" or "w2_BEYOND") or "w2_fog"
+        elseif c.arr and c.arr <= c.t + lead + 2 then c.class = "HIT"
+        elseif c.arr and c.arr <= c.t + lead + 6 then c.class = "PARTIAL"
+        elseif c.arr then c.class = "LATE"
+        else c.class = "GONE" end
+    end
+    local function med(t) table.sort(t); return #t > 0 and t[math.ceil(#t / 2)] or 0 end
+    print(string.format("--- cast report --- %d lane W casts", #casts))
+    local groups = {}
+    for _, c in ipairs(casts) do
+        local g = (c.src == "shove_pre") and (c.fog and "fog_pre" or "live_pre") or c.src
+        groups[g] = groups[g] or {}
+        table.insert(groups[g], c)
+    end
+    for _, gname in ipairs({ "live_pre", "fog_pre", "shove_w2", "shove" }) do
+        local list = groups[gname]
+        if list then
+            local cls, dws, lags = {}, {}, {}
+            for _, c in ipairs(list) do
+                cls[c.class] = (cls[c.class] or 0) + 1
+                if c.dw then dws[#dws + 1] = c.dw end
+                if c.arr and c.lead then lags[#lags + 1] = c.arr - (c.t + c.lead) end
+            end
+            local parts = {}
+            for k, v in pairs(cls) do parts[#parts + 1] = string.format("%s=%d", k, v) end
+            table.sort(parts)
+            print(string.format("  %-9s n=%-3d dW/dref med=%-5.0f arr-lag med=%+.1fs  [%s]",
+                gname, #list, med(dws), med(lags), table.concat(parts, " ")))
+        end
+    end
+    -- wasted-trip recount (same rule as farm-report) for the size comparison
+    local wasted, wtravel, cur, cast_seen = 0, 0, nil, false
+    for _, e in ipairs(events) do
+        if e.event == "farm" then
+            if cur and not cast_seen and (tonumber(cur.kv.travel) or 0) > 2 then
+                wasted = wasted + 1; wtravel = wtravel + (tonumber(cur.kv.travel) or 0)
+            end
+            cur = (e.kv.pick == "shove") and e or nil
+            cast_seen = false
+        elseif e.event == "march_aim" and (e.kv.src == "shove" or e.kv.src == "shove_pre" or e.kv.src == "shove_w2") then
+            cast_seen = true
+        end
+    end
+    print(string.format("  vs churn: wasted shove trips %d (est travel %.0fs)", wasted, wtravel))
     os.exit(0)
 elseif mode == "depth_audit" then
     -- THE WALK-LAW VERIFIER (v0.1.198, after 5+ hours of manual deep-walk hunting): the invariant
@@ -961,19 +1273,30 @@ elseif mode == "depth_audit" then
     --   stands / keen landings / tether holds:  depth > 600  (line 550 + 50 slop)
     --   W casts (cast point <= ~300 ahead of the hero): depth > 910 (550 + 300 + 60)
     -- klvl >= 2 events are reported separately (raid-era; legal by the keen rule).
-    local WALK_MAX, F_GOOD, F_BAD = 550, { x = -7456, y = -6938 }, { x = 7408, y = 6848 }
+    -- v0.1.327 S2 PER-LANE DEPTH: the audit consumes THE SAME lib ruler as the brain
+    -- (Lane.DepthRuler/Lane.Depth, zero = each lane's T1 midpoint) so auditor-brain drift is
+    -- impossible. WALK_MAX re-zeroed 550 -> 1100 with the frame (preserves the .324 Radiant
+    -- reference; Dire gains the identical band). Events carry no lane -> nearest-zero pick.
+    local LN, MD = require("lib.lane"), require("lib.map_data")
+    local WALK_MAX = 1100
     -- v0.1.258: LAST self_acquired wins - debug.log can hold several script loads (run-73:
     -- a team-2 setup session before the team-3 real game); the first one mis-teamed the audit.
     local team = 2
     for _, e in ipairs(events) do
         if e.event == "self_acquired" then team = tonumber(e.kv.team) or team end
     end
-    local fp = (team == 2) and F_GOOD or F_BAD
-    local ep = (team == 2) and F_BAD or F_GOOD
-    local mx, my = (fp.x + ep.x) / 2, (fp.y + ep.y) / 2
-    local ax, ay = ep.x - fp.x, ep.y - fp.y
-    local al = math.sqrt(ax * ax + ay * ay)
-    local function depth(x, y) return (x - mx) * (ax / al) + (y - my) * (ay / al) end
+    local ruler = LN.DepthRuler(MD.TOWERS, MD.FOUNTAINS, team)
+    if not ruler then io.stderr:write("depth-audit: no ruler (map_data)\n"); os.exit(2) end
+    local zlist = {}
+    for ln, z in pairs(ruler.zero) do zlist[#zlist + 1] = { ln = ln, x = z.x, y = z.y } end
+    local function depth(x, y)
+        local best, bd
+        for _, z in ipairs(zlist) do
+            local dd = (x - z.x) * (x - z.x) + (y - z.y) * (y - z.y)
+            if not bd or dd < bd then bd, best = dd, z.ln end
+        end
+        return LN.Depth(ruler, { x = x, y = y }, best)
+    end
 
     local now_t, klvl = 0, 1
     local viol, raid_deep, checked = {}, {}, 0
@@ -991,16 +1314,16 @@ elseif mode == "depth_audit" then
         local ts = tonumber(e.kv.t); if ts then now_t = ts end
         if e.event == "farm" then
             klvl = tonumber(e.kv.klvl) or klvl
-            if e.kv.pick == "shove" then check("stand", e.kv.sx, e.kv.sy, 600) end
+            if e.kv.pick == "shove" then check("stand", e.kv.sx, e.kv.sy, WALK_MAX + 50) end
         elseif e.event == "keen_to_anchor" then
             local lx, ly = (e.raw or ""):match("land=%((%-?%d+),(%-?%d+)%)")
-            check("keen_land", lx, ly, 600, "anchor=" .. tostring(e.kv.anchor))
+            check("keen_land", lx, ly, WALK_MAX + 50, "anchor=" .. tostring(e.kv.anchor))
         elseif e.event == "tether" then
             local hx, hy = (e.raw or ""):match("hold=%((%-?%d+),(%-?%d+)%)")
-            check("tether_hold", hx, hy, 600)
+            check("tether_hold", hx, hy, WALK_MAX + 50)
         elseif e.event == "march_aim" and e.kv.src == "shove" then
             local cx2, cy2 = (e.raw or ""):match("cast=%((%-?%d+),(%-?%d+)%)")
-            check("w_cast", cx2, cy2, 910, "pat=" .. tostring(e.kv.pat))
+            check("w_cast", cx2, cy2, WALK_MAX + 360, "pat=" .. tostring(e.kv.pat))
         elseif e.event == "lane_go" and (e.raw or ""):find("deep_reject") then
             viol[#viol + 1] = { t = now_t, kind = "TRIPWIRE", x = 0, y = 0, d = 0, klvl = klvl,
                                 extra = e.raw:match("deep_reject.*") or "" }

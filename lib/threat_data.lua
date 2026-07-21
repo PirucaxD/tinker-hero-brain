@@ -725,11 +725,11 @@ ThreatData.THREATS_ON_SELF = {
     modifier_sandking_burrowstrike                  = { role = "line_projectile",  save = "perp_displacement" },
     modifier_nyx_assassin_impale                    = { role = "line_projectile",  save = "perp_displacement" },
     -- batch 3-4 (defense catalog refresh, 2026-05-17)
-    modifier_necrolyte_reapers_scythe               = { role = "magic_burst",      save = "bkb_or_lotus" },
+    modifier_necrolyte_reapers_scythe               = { role = "magic_burst",      save = "bkb_or_lotus", breaks_channel = true },  -- E3c sweep: targeted ult, 1.5s stun
     modifier_obsidian_destroyer_sanity_eclipse      = { role = "magic_burst",      save = "bkb_or_lotus" },
     modifier_lich_chain_frost                       = { role = "magic_burst",      save = "bkb_or_lotus" },
     modifier_skywrath_mystic_flare_aura_effect             = { role = "delayed_aoe",      save = "displacement" },
-    modifier_mars_gods_rebuke                       = { role = "physical_burst",   save = "glimmer_or_ghost" },
+    modifier_mars_gods_rebuke                       = { role = "physical_burst",   save = "glimmer_or_ghost", breaks_channel = true },  -- E3c sweep: KV 0.3s knockback
     modifier_snapfire_scatterblast_slow                  = { role = "magic_burst",      save = "bkb_or_displacement" },
     modifier_bloodseeker_rupture                    = { role = "magic_burst",      save = "dispel" },
     modifier_obsidian_destroyer_astral_imprisonment = { role = "hard_disable",     save = "eul_or_bkb" },
@@ -753,11 +753,45 @@ ThreatData.THREATS_ON_SELF = {
     -- generic modifier_stunned (harvested), so this entry serves the CHANNEL GATE
     -- (kit-awareness) + pre-impact recognition, not the reactive path.
     modifier_lina_light_strike_array                = { role = "delayed_aoe",      save = "displacement", breaks_channel = true },
+
+    -- E3c COVERAGE SWEEP (2026-07-14, tools/gen_channel_breaker_audit.py over the
+    -- KV: 50 kit abilities carried stun/ministun/knockback evidence invisible to
+    -- the channel gate). Tier-1 additions: unambiguous ACTIVE cast stuns and
+    -- knockbacks. Victim-side mod names follow the modifier_<ability> convention
+    -- and are UNVERIFIED unless noted - they serve the GATE (kit walk); if the
+    -- real landed mod differs, the harvest log names it for fixup. DELIBERATE
+    -- SKIPS (documented in the audit tool + bridge): gap_close role class
+    -- (onslaught/charge/gyroshell/snowball/suicide - E1 design exclusion),
+    -- anywhere-landing ults (solar_guardian, gyro missile), situational triggers
+    -- (nyx carapace, hoodwink decoy, phoenix egg, spark wraith zones), passives/
+    -- summon procs (greater bash, repulsion, lycan wolves), facet/marginal
+    -- (glacier 0.1s, meepo fling, muerta slug, horn toss), line skillshots kept
+    -- on the armed-threat path (mars spear, rolling boulder).
+    modifier_centaur_hoof_stomp                     = { role = "hard_disable", breaks_channel = true },  -- E3c sweep: KV stun 1.6-2.2s aoe
+    modifier_earthshaker_fissure                    = { role = "hard_disable", breaks_channel = true },  -- E3c sweep: KV stun 1.0-1.6s line (instant, not dodgeable while channeling)
+    modifier_monkey_king_boundless_strike           = { role = "hard_disable", breaks_channel = true },  -- E3c sweep: KV stun 0.7-1.3s line
+    modifier_skeleton_king_hellfire_blast           = { role = "hard_disable", breaks_channel = true },  -- E3c sweep: KV stun 1.0-1.6s targeted (WK)
+    modifier_snapfire_firesnap_cookie               = { role = "hard_disable", breaks_channel = true },  -- E3c sweep: KV impact stun 1.0-2.2s
+    modifier_primal_beast_rock_throw                = { role = "hard_disable", breaks_channel = true },  -- E3c sweep: KV stun 1.4s
+    modifier_kunkka_ghostship                       = { role = "delayed_aoe", breaks_channel = true },  -- E3c sweep: KV stun 1.2s at impact
+    modifier_antimage_mana_void                     = { role = "magic_burst", breaks_channel = true },  -- E3c sweep: KV ministun 0.3s targeted ult
+    modifier_luna_lucent_beam                       = { role = "magic_burst", breaks_channel = true },  -- E3c sweep: KV stun 0.6s targeted (verify: may be facet/ult-gated)
+    modifier_invoker_deafening_blast                = { role = "delayed_aoe", breaks_channel = true },  -- E3c sweep: KV knockback 1.1-2.1s (knockbacks interrupt)
+    modifier_queenofpain_sonic_wave                 = { role = "delayed_aoe", breaks_channel = true },  -- E3c sweep: KV knockback 1.4s cone ult
+    modifier_drow_ranger_wave_of_silence            = { role = "delayed_aoe", breaks_channel = true },  -- E3c sweep: KV knockback 0.6-0.9s
+    modifier_huskar_inner_fire                      = { role = "delayed_aoe", breaks_channel = true },  -- E3c sweep: KV knockback 1.0s radial
+    modifier_batrider_flamebreak                    = { role = "delayed_aoe", breaks_channel = true },  -- E3c sweep: KV stun 0.5s + knockback 0.35s
+    modifier_bounty_hunter_wind_walk                = { role = "hard_disable", breaks_channel = true },  -- E3c sweep: KV invis-strike stun 1.0-1.6s (fogged-disc covers the invis; melee floor range)
+    modifier_warlock_rain_of_chaos                  = { role = "delayed_aoe", breaks_channel = true },  -- E3c sweep: KV stun 0.8s at golem landing
+    modifier_dawnbreaker_fire_wreath                = { role = "hard_disable", breaks_channel = true },  -- E3c sweep: KV smash stun 0.6-1.2s melee arc
+    modifier_visage_stone_form_self_cast            = { role = "delayed_aoe", breaks_channel = true },  -- E3c sweep: KV stun 0.8-1.2s radial on landing
+    modifier_elder_titan_echo_stomp                 = { role = "delayed_aoe", breaks_channel = true },  -- E3c sweep: KV initial stun 0.2s + sleep
+    modifier_kez_shodo_sai                          = { role = "hard_disable", breaks_channel = true },  -- E3c sweep: KV stun 0.5-0.8s (verify: new hero, mechanics evolving)
     -- E3c (run-77 harvest x4): Fissure's LANDED victim-side stun is a separate mod
     -- with its OWN profile (severity=lethal at :327) - an alias would shadow that
     -- profile, so it gets its own entry (the recognition + landed-disable flee).
     modifier_earthshaker_fissure_stun               = { role = "hard_disable",     save = "displacement" },
-    modifier_puck_dream_coil                        = { role = "delayed_aoe",      save = "displacement" },
+    modifier_puck_dream_coil                        = { role = "delayed_aoe",      save = "displacement", breaks_channel = true },  -- E3c sweep: KV initial 0.5s stun on coil cast
     modifier_leshrac_split_earth                    = { role = "delayed_aoe",      save = "displacement" },
     modifier_jakiro_ice_path                        = { role = "delayed_aoe",      save = "displacement", breaks_channel = true },  -- E3c: 1.25-2s stun (Liquipedia) - breaks Rearm/Keen channels (Tinker run-77)
     modifier_mars_arena_of_blood                    = { role = "delayed_aoe",      save = "blink_or_bkb" },
@@ -767,7 +801,7 @@ ThreatData.THREATS_ON_SELF = {
     modifier_dark_willow_terrorize                  = { role = "delayed_aoe",      save = "displacement" },
     modifier_dark_willow_bramble_maze               = { role = "delayed_aoe",      save = "displacement" },
     modifier_ringmaster_the_box                     = { role = "trapped",          save = "knockback_or_blink" },
-    modifier_ringmaster_wheel                       = { role = "delayed_aoe",      save = "displacement" },
+    modifier_ringmaster_wheel                       = { role = "delayed_aoe",      save = "displacement", breaks_channel = true },  -- E3c sweep: KV 0.35s knockback (knockbacks interrupt channels)
     modifier_kez_raptor_dance                       = { role = "delayed_aoe",      save = "displacement" },
     modifier_void_spirit_astral_step                = { role = "gap_close",        save = "pike_or_grenade" },
     modifier_pangolier_gyroshell                    = { role = "gap_close",        save = "pike_or_grenade" },
@@ -789,7 +823,7 @@ ThreatData.THREATS_ON_SELF = {
     modifier_ice_blast     = { role = "magic_burst",  save = "bkb_or_lotus" },      -- vpk - frost mark, executes <12% HP. BKB blocks (SPELL_IMMUNITY_ENEMIES_YES)
     modifier_gyrocopter_homing_missile        = { role = "line_projectile", save = "perp_displacement" },  -- vpk - homing target debuff, missile is dodgeable
     modifier_gyrocopter_call_down_slow        = { role = "kiting_slow",  save = "informational" },     -- vpk - per-rocket slow proc
-    modifier_kunkka_torrent_thinker           = { role = "delayed_aoe",  save = "displacement" },      -- (verify) - geyser warning placed, hits ~1.5s later
+    modifier_kunkka_torrent_thinker           = { role = "delayed_aoe",  save = "displacement", breaks_channel = true },      -- (verify) - geyser warning placed, hits ~1.5s later  -- E3c sweep: KV stun 1.4s at splash (delay 1.6 < the 2.7-2.93s channels)
     modifier_kunkka_torrent_stun              = { role = "hard_disable", save = "eul_or_bkb" },        -- (verify) - stun applied at geyser impact
     modifier_kunkka_x_marks_the_spot          = { role = "hard_disable", save = "bkb_or_dispel" },     -- vpk - drag-back debuff, removable by dispel
     modifier_nevermore_requiem                = { role = "magic_burst",  save = "bkb_or_lotus" },      -- vpk - fear + magic damage radial
@@ -883,11 +917,11 @@ ThreatData.THREATS_ON_SELF = {
     modifier_zuus_thundergods_wrath      = { role = "magic_burst",   save = "bkb_or_pipe" },           -- (verify) - global ult, 2s cast point
     modifier_tidehunter_ravage           = { role = "delayed_aoe",   save = "bkb_or_blink" },          -- vpk
     modifier_earthshaker_echo_slam       = { role = "delayed_aoe",   save = "bkb_or_blink" },          -- (verify)
-    modifier_magnataur_reverse_polarity_stun  = { role = "delayed_aoe",   save = "bkb_or_blink" },          -- vpk - 1700u radius
+    modifier_magnataur_reverse_polarity_stun  = { role = "delayed_aoe",   save = "bkb_or_blink", breaks_channel = true },          -- vpk - 1700u radius  -- E3c sweep: KV hero stun 2.5-3.5s
     modifier_disruptor_static_storm_thinker = { role = "delayed_aoe", save = "displacement_or_bkb" },  -- vpk - channel
     modifier_treant_overgrowth           = { role = "delayed_aoe",   save = "blink_or_manta" },        -- vpk - AoE root
     modifier_magnataur_skewer            = { role = "line_projectile", save = "perp_displacement" },   -- vpk - pre_cast save
-    modifier_sven_storm_bolt             = { role = "line_projectile", save = "perp_displacement" },   -- (verify)
+    modifier_sven_storm_bolt             = { role = "line_projectile", save = "perp_displacement", breaks_channel = true },   -- (verify)  -- E3c sweep: targeted (undodgeable) 1.0-1.6s stun
     modifier_earth_spirit_rolling_boulder= { role = "line_projectile", save = "perp_displacement" },   -- vpk
     modifier_life_stealer_open_wounds    = { role = "physical_burst", save = "manta_or_pike" },        -- vpk - debuff
     modifier_pugna_life_drain            = { role = "drain",         save = "force_or_pike" },         -- vpk - channel
@@ -1110,6 +1144,28 @@ ThreatData.ABILITY_TO_THREAT = {
     puck_dream_coil                     = "modifier_puck_dream_coil",
     leshrac_split_earth                 = "modifier_leshrac_split_earth",
     jakiro_ice_path                     = "modifier_jakiro_ice_path",
+
+    -- E3c coverage sweep (gate-serving; mod names by convention, see THREATS_ON_SELF note)
+    centaur_hoof_stomp                  = "modifier_centaur_hoof_stomp",
+    earthshaker_fissure                 = "modifier_earthshaker_fissure",
+    monkey_king_boundless_strike        = "modifier_monkey_king_boundless_strike",
+    skeleton_king_hellfire_blast        = "modifier_skeleton_king_hellfire_blast",
+    snapfire_firesnap_cookie            = "modifier_snapfire_firesnap_cookie",
+    primal_beast_rock_throw             = "modifier_primal_beast_rock_throw",
+    kunkka_ghostship                    = "modifier_kunkka_ghostship",
+    antimage_mana_void                  = "modifier_antimage_mana_void",
+    luna_lucent_beam                    = "modifier_luna_lucent_beam",
+    invoker_deafening_blast             = "modifier_invoker_deafening_blast",
+    queenofpain_sonic_wave              = "modifier_queenofpain_sonic_wave",
+    drow_ranger_wave_of_silence         = "modifier_drow_ranger_wave_of_silence",
+    huskar_inner_fire                   = "modifier_huskar_inner_fire",
+    batrider_flamebreak                 = "modifier_batrider_flamebreak",
+    bounty_hunter_wind_walk             = "modifier_bounty_hunter_wind_walk",
+    warlock_rain_of_chaos               = "modifier_warlock_rain_of_chaos",
+    dawnbreaker_fire_wreath             = "modifier_dawnbreaker_fire_wreath",
+    visage_stone_form_self_cast         = "modifier_visage_stone_form_self_cast",
+    elder_titan_echo_stomp              = "modifier_elder_titan_echo_stomp",
+    kez_shodo_sai                       = "modifier_kez_shodo_sai",
     mars_arena_of_blood                 = "modifier_mars_arena_of_blood",
     sandking_epicenter                  = "modifier_sand_king_epicenter",
     templar_assassin_psionic_trap       = "modifier_templar_assassin_psionic_trap",

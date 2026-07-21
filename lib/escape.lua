@@ -753,6 +753,35 @@ function Escape.NearbyEnemiesIncludingFog(me, pos, radius, opts)
     return v_cnt, f_cnt, out
 end
 
+---Count FOGGED enemies whose FRESH probable-disc reaches within opts.radius of
+---`pos`. Tighter than NearbyEnemiesIncludingFog: only enemies seen within
+---opts.fresh_s count, and the disc reach is capped at opts.reach_cap (a stale
+---blip's huge disc is rejected, not trusted). Pure: component math on pos.x/.y,
+---so plain {x,y} tables work (the type-boundary law).
+---@param snapshot table {heroes = {{pos, age, probable_radius, visible}}}
+---@param pos table {x, y}
+---@param opts table {radius=1000, reach_cap=450, fresh_s=1.5}
+---@return integer count
+function Escape.ReachableFog(snapshot, pos, opts)
+    local hs = snapshot and snapshot.heroes
+    if not (hs and pos) then return 0 end
+    opts = opts or {}
+    local radius  = opts.radius or 1000
+    local cap     = opts.reach_cap or 450
+    local fresh_s = opts.fresh_s or 1.5
+    local n = 0
+    for i = 1, #hs do
+        local h = hs[i]
+        if h.visible == false and (h.age or 0) <= fresh_s and h.pos then
+            local dx, dy = (h.pos.x or 0) - (pos.x or 0), (h.pos.y or 0) - (pos.y or 0)
+            local d = math.sqrt(dx * dx + dy * dy)
+            local disc = math.min(h.probable_radius or 0, cap)
+            if d - disc <= radius then n = n + 1 end
+        end
+    end
+    return n
+end
+
 ---Composite risk score for a candidate landing position. Lower is safer;
 ---0 = no enemies in or near the engage radius.
 ---

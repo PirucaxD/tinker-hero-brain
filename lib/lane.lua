@@ -591,6 +591,17 @@ local CREEP_STATS = {
 local function _stat_hp(s, cyc)   return s.hp + s.hpc * cyc end
 local function _stat_gold(s, cyc) return s.gold + s.goldc * cyc end
 
+---per-creep expected stats at `game_time` (seconds, game clock). Pure. kind in
+---melee|ranged|siege|smelee|sranged|mmelee|mranged (see CREEP_STATS).
+---@return table|nil { hp, gold, dmg, atk, armor, atype }
+function Lane.CreepStats(kind, game_time)
+    local s = CREEP_STATS[kind]
+    if not s then return nil end
+    local cyc = math.min(30, math.floor(math.max(0, game_time or 0) / 450))
+    return { hp = _stat_hp(s, cyc), gold = _stat_gold(s, cyc),
+             dmg = s.dmg + s.dmgc * cyc, atk = s.atk, armor = s.armor, atype = s.atype }
+end
+
 ---expected wave composition + value at `game_time` (seconds, game clock). opts.super / opts.mega
 ---swap regular melee/ranged for super/mega stats (barracks state; default regular). Pure.
 ---@return table { wave, cycle, melee, ranged, siege, flagbearer, count, hp, gold, strength }
@@ -815,6 +826,59 @@ function Lane.ScanLanes(opts)
         opts.team = me and Entity.GetTeamNum(me) or nil
     end
     return Lane.BuildLaneStates(_read_lane_creeps(), _read_towers(), _read_heroes(), opts)
+end
+
+-- ---- S2 per-lane depth ruler (v0.1.327, the side-parity fix) ---------------
+-- The old depth zero (the FOUNTAIN midpoint) sits ~580 lane-units toward Radiant
+-- of the mid lane's true centre (the T1 midpoint = where waves actually meet), so
+-- every absolute depth threshold was ~580 stricter for Dire and ~580 looser for
+-- Radiant on mid. The ruler zeroes per lane instead; the axis stays the fountain
+-- axis (vs the mid chord it differs by < 2 degrees). Pure functions - the hero
+-- brain AND tools/parse_debuglog's depth-audit consume THESE, so the auditor can
+-- never drift from the brain. Ceiling (S4, the tree review 2026-07-20):
+-- arc-length depth along BuildLanePaths if side-lane precision ever needs it -
+-- same contract, internal swap.
+
+---build the per-team depth ruler from static map data. towers/fountains are
+---map_data-shaped lists ({name=, team=, pos={x,y,z}}); team = the OWN team id.
+---Returns { ax, ay (unit axis own->enemy), zero = { mid={x,y}, top=..., bot=... } }
+---or nil when the inputs are unusable.
+function Lane.DepthRuler(towers, fountains, team)
+    local fp, ep
+    for _, f in ipairs(fountains or {}) do
+        if f.pos then
+            if f.team == team then fp = f.pos else ep = f.pos end
+        end
+    end
+    if not (fp and ep) then return nil end
+    local ax, ay = ep[1] - fp[1], ep[2] - fp[2]
+    local al = math.sqrt(ax * ax + ay * ay)
+    if al < 1 then return nil end
+    local acc = {}
+    for _, t in ipairs(towers or {}) do
+        local ln = t.name and t.name:match("tower1_(%w+)")
+        if ln and t.pos then
+            acc[ln] = acc[ln] or {}
+            table.insert(acc[ln], t.pos)
+        end
+    end
+    local zero = {}
+    for ln, ps in pairs(acc) do
+        if #ps == 2 then
+            zero[ln] = { x = (ps[1][1] + ps[2][1]) * 0.5, y = (ps[1][2] + ps[2][2]) * 0.5 }
+        end
+    end
+    if not zero.mid then return nil end
+    return { ax = ax / al, ay = ay / al, zero = zero }
+end
+
+---signed lane-frame depth of pos ({x,y} or Vector) for `lane` (defaults to mid;
+---an unknown lane falls back to mid). 0 = the lane's T1 midpoint (the meet
+---ground); + = enemy side; own mid T1 reads ~-1459, enemy mid T1 ~+1459.
+function Lane.Depth(ruler, pos, lane)
+    if not (ruler and pos) then return 0 end
+    local z = ruler.zero[lane or "mid"] or ruler.zero.mid
+    return (pos.x - z.x) * ruler.ax + (pos.y - z.y) * ruler.ay
 end
 
 return Lane

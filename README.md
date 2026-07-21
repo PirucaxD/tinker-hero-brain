@@ -6,7 +6,29 @@ reacts to enemy disables and threats with defensive item saves and escapes.
 It never auto-engages enemy heroes. Offense and combo layers are planned
 follow-ups on the same shared `lib/`.
 
-Current build: **Tinker.lua v0.1.265**.
+Current build: **Tinker.lua v0.1.331**.
+
+## What changed since v0.1.265 (for returning testers)
+
+The farm layer went through a long stabilization line and is now the best it
+has ever been (bot-game reference: GPM ~450 with zero deaths, ~90% wave
+coverage). Highlights:
+
+- **Faction parity fixed.** A depth-ruler defect made Dire games camp under
+  the T1 instead of stepping forward to the wave meeting ground like Radiant
+  games did. Both factions now keen in, walk forward, and pre-cast at the
+  meeting point.
+- **Forward pre-cast posture.** The brain pre-positions ahead of the wave and
+  pre-fires March so the wave dies on arrival, then keens away.
+- **No more statues.** Stalled-wave holds, carried-away camp trips, and
+  between-wave freezes all got explicit exits (stall release, contest
+  re-check on arrival, idle pre-positioning at the next stand).
+- **Keen level 2 raids are live.** Deep keen-dives onto allied creeps fire
+  once Keen hits level 2, gated by the walk-depth law and a bail check.
+- **Keen telemetry (v0.1.331).** Every teleport now logs its jump distance,
+  landing residual, purpose, and mana, and a new `--keen-report` analyzer
+  classifies every keen by outcome. If you want to help tune teleport
+  efficiency, attach that report to your issue.
 
 ## What it does
 
@@ -44,9 +66,10 @@ Typical bot-game result on an itemless build: 450-600+ GPM with zero deaths.
 - `lib/` - hero-agnostic libraries: map/camp data, lane wave scanning and
   prediction, route planning, scheduling, navigation, escape and risk math,
   plus KV-generated game data. Pure logic is engine-stubbed and unit-tested.
-- `tools/run_tests.lua` - the offline test suite (728 tests, no game needed).
+- `tools/run_tests.lua` - the offline test suite (753 tests, no game needed).
 - `tools/parse_debuglog.lua` - the log analyzer (farm/depth audits, per-wave
-  coverage, time and gold accounting). Useful when reporting issues.
+  coverage, time and gold accounting, keen efficiency). Useful when
+  reporting issues.
 
 ## Requirements
 
@@ -108,6 +131,7 @@ lua tools/parse_debuglog.lua C:/Umbrella/debug.log --farm-report
 lua tools/parse_debuglog.lua C:/Umbrella/debug.log --time-report
 lua tools/parse_debuglog.lua C:/Umbrella/debug.log --farm-audit
 lua tools/parse_debuglog.lua C:/Umbrella/debug.log --depth-audit
+lua tools/parse_debuglog.lua C:/Umbrella/debug.log --keen-report
 ```
 
 The audits should read zero violations; the reports show GPM, per-wave lane
@@ -118,7 +142,7 @@ to get it fixed.
 Offline development loop:
 
 ```
-lua tools/run_tests.lua          # pure-Lua suite, expect 728 passing
+lua tools/run_tests.lua          # pure-Lua suite, expect 753 passing
 luac -p Tinker/Tinker.lua        # byte-compile check
 ```
 
